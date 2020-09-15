@@ -27,7 +27,7 @@
 #include <cmath>
 #include <tuple>
 #include "query/time_series_aggregate.h"
-#include "query/utils.hpp"
+#include "utils.hpp"
 
 namespace ares {
 
@@ -373,6 +373,83 @@ ColumnIterator<Value> make_column_iterator(
       indexVector);
 }
 
+//////////////////////////////////////////////////////////////
+// Array VectorParty Iterator
+// The VectorParty Iterator for Array Column
+/////////////////////////////////////////////////////////////
+template<typename Value>
+class ArrayVectorPartyIterator
+    : public thrust::iterator_adaptor<
+          ArrayVectorPartyIterator<Value>, uint64_t*,
+          thrust::tuple<Value*, bool>,
+          thrust::use_default, thrust::use_default,
+          thrust::tuple<Value*, bool>,
+          thrust::use_default> {
+ public:
+  friend class thrust::iterator_core_access;
+  typedef thrust::iterator_adaptor<ArrayVectorPartyIterator<Value>,
+                                   uint64_t*, thrust::tuple<Value*, bool>,
+                                   thrust::use_default, thrust::use_default,
+                                   thrust::tuple<Value*, bool>,
+                                   thrust::use_default> super_t;
+
+  __host__ __device__ ArrayVectorPartyIterator() {}
+
+  // base is counts vector if mode 0. nulls vector if mode 2, values vector
+  // if mode 0.
+  __host__ __device__
+  ArrayVectorPartyIterator(
+      uint8_t *basePtr,
+      uint32_t valueOffsetAdj,
+      uint32_t length)
+      : super_t(reinterpret_cast<uint64_t *>(basePtr)),
+        basePtr(basePtr),
+        valuePtr(basePtr + 8 * length - valueOffsetAdj),
+        length(length) {
+  }
+
+ private:
+  uint8_t *basePtr;
+  uint8_t *valuePtr;
+  uint32_t length;
+
+  __host__ __device__
+  typename super_t::reference dereference() const {
+    uint32_t offset = *(reinterpret_cast<uint32_t *>(this->base_reference()));
+    uint32_t length = *(reinterpret_cast<uint32_t *>(this->base_reference())+1);
+    int n = static_cast<int>(this->base_reference() -
+            reinterpret_cast<uint64_t *>(basePtr));
+
+    if (length == 0) {
+      return thrust::make_tuple(reinterpret_cast<Value*>(NULL), offset != 0);
+    }
+    return thrust::make_tuple(
+        reinterpret_cast<Value*>(valuePtr + offset), true);
+  }
+
+  __host__ __device__
+  void advance(typename super_t::difference_type n) {
+    this->base_reference() += n;
+  }
+
+  __host__ __device__
+  void increment() {
+    advance(1);
+  }
+
+  __host__ __device__
+  void decrement() {
+    advance(-1);
+  }
+};
+
+// Helper function for creating ArrayVectorPartyIterator
+template<typename Value>
+inline ArrayVectorPartyIterator<Value> make_array_column_iterator(
+    uint8_t* basePtr, int valueOffsetAdj, uint32_t length) {
+  return ArrayVectorPartyIterator<Value>(basePtr, valueOffsetAdj, length);
+}
+
 // SimpleIterator combines interators in 4 different cases:
 // 1. Constant value.
 // 2. Mode 0 column, equivalent to constant value.
@@ -403,6 +480,7 @@ class SimpleIterator :
 
   __host__ __device__ SimpleIterator() {}
 
+  __host__ __device__
   SimpleIterator(
       Value *values,
       uint32_t nullsOffset,
@@ -511,6 +589,14 @@ SimpleIterator<Value> make_scratch_space_input_iterator(
   return SimpleIterator<Value>(reinterpret_cast<Value *>(valueIter),
                                nullOffset, 0, 0);
 }
+
+template<>
+SimpleIterator<UUIDT> make_scratch_space_input_iterator<UUIDT>(
+    uint8_t *valueIter, uint32_t nullOffset);
+
+template<>
+SimpleIterator<GeoPointT> make_scratch_space_input_iterator<GeoPointT>(
+    uint8_t *valueIter, uint32_t nullOffset);
 
 template<typename Value>
 using ScratchSpaceOutputIterator = thrust::zip_iterator<
@@ -844,21 +930,32 @@ class RecordIDJoinIterator
   }
 };
 
-// DimensionHashIterator reads DimensionColumnVector and produce hashed values
+// DimensionHashIterator reads DimensionVector and produce hashed values
+template<int hash_bytes = 64, typename IndexVectorType = uint32_t *>
 class DimensionHashIterator
     : public thrust::iterator_adaptor<
-        DimensionHashIterator, uint32_t *, uint64_t, thrust::use_default,
-        thrust::use_default, uint64_t, thrust::use_default> {
+        DimensionHashIterator<hash_bytes, IndexVectorType>,
+        IndexVectorType,
+        typename hash_output_type<hash_bytes>::type,
+        thrust::use_default,
+        thrust::use_default,
+        typename hash_output_type<hash_bytes>::type,
+        thrust::use_default> {
  public:
   friend class thrust::iterator_core_access;
-  typedef thrust::iterator_adaptor<DimensionHashIterator, uint32_t *, uint64_t,
-                                   thrust::use_default, thrust::use_default,
-                                   uint64_t, thrust::use_default>
-      super_t;
+  typedef thrust::iterator_adaptor<
+      DimensionHashIterator<hash_bytes, IndexVectorType>,
+      IndexVectorType,
+      typename hash_output_type<hash_bytes>::type,
+      thrust::use_default,
+      thrust::use_default,
+      typename hash_output_type<hash_bytes>::type,
+      thrust::use_default> super_t;
 
   __host__ __device__
-  DimensionHashIterator(uint8_t *dimValues, uint32_t *indexVector,
-                        uint8_t _numDimsPerDimWidth[NUM_DIM_WIDTH], int length)
+  DimensionHashIterator(uint8_t *dimValues,
+                        uint8_t _numDimsPerDimWidth[NUM_DIM_WIDTH], int length,
+                        IndexVectorType indexVector = IndexVectorType(0))
       : super_t(indexVector), dimValues(dimValues), length(length) {
     totalNumDims = 0;
     rowBytes = 0;
@@ -884,7 +981,6 @@ class DimensionHashIterator
   __host__ __device__ typename super_t::reference dereference() const {
     uint32_t index = *this->base_reference();
     uint8_t dimRow[MAX_DIMENSION_BYTES] = {0};
-    uint64_t hashedOutput[2];
     // read from
     uint8_t *inputValueStart = dimValues;
     uint8_t *inputNullStart = nullValues;
@@ -924,38 +1020,23 @@ class DimensionHashIterator
       }
       numDims += numDimsPerDimWidth[i];
     }
-    murmur3sum128(dimRow, rowBytes, 0, hashedOutput);
-    // only use the first 64bit of the 128bit hash
-    return hashedOutput[0];
+    return murmur3sum<hash_bytes>(dimRow, rowBytes, 0);
   }
 };
 
 class DimValueProxy {
  public:
   __host__ __device__ DimValueProxy(uint8_t *ptr, int dimBytes)
-      : ptr(ptr), dimBytes(dimBytes) {}
+      : ptr(ptr), dimBytes(static_cast<uint16_t >(dimBytes)) {}
 
   __host__ __device__ DimValueProxy operator=(DimValueProxy t) {
-    switch (dimBytes) {
-      case 16:
-        *reinterpret_cast<UUIDT *>(ptr) = *reinterpret_cast<UUIDT *>(t.ptr);
-      case 8:
-        *reinterpret_cast<uint64_t *>(ptr) =
-            *reinterpret_cast<uint64_t *>(t.ptr);
-      case 4:
-        *reinterpret_cast<uint32_t *>(ptr) =
-            *reinterpret_cast<uint32_t *>(t.ptr);
-      case 2:
-        *reinterpret_cast<uint16_t *>(ptr) =
-            *reinterpret_cast<uint16_t *>(t.ptr);
-      case 1:*ptr = *t.ptr;
-    }
+    setDimValue(ptr, t.ptr, dimBytes);
     return *this;
   }
 
  private:
   uint8_t *ptr;
-  int dimBytes;
+  uint16_t dimBytes;
 };
 
 class DimensionColumnPermutateIterator
@@ -1003,8 +1084,8 @@ class DimensionColumnPermutateIterator
     for (; i < NUM_DIM_WIDTH; i++) {
       dimBytes = 1 << (NUM_DIM_WIDTH - i - 1);
       if (dimIndex < numDims + numDimsPerDimWidth[i]) {
-        bytes +=
-            ((dimIndex - numDims) * dimInputLength + localIndex) * dimBytes;
+        bytes += ((dimIndex - numDims) * dimInputLength +
+            localIndex) * dimBytes;
         break;
       } else {
         bytes += numDimsPerDimWidth[i] * dimInputLength * dimBytes;

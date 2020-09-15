@@ -22,7 +22,7 @@ import (
 	"sync"
 )
 
-// jobManager is responsible for generating new jobs to run and manages job related stats.
+// JobManager is responsible for generating new jobs to run and manages job related stats.
 type jobManager interface {
 	generateJobs() []Job
 	getJobDetails() interface{}
@@ -62,7 +62,7 @@ func (m *archiveJobManager) generateJobs() []Job {
 	for tableName, shardMap := range m.memStore.TableShards {
 		for shardID, tableShard := range shardMap {
 			tableShard.Schema.RLock()
-			if tableShard.Schema.Schema.IsFactTable {
+			if tableShard.Schema.Schema.IsFactTable && tableShard.IsDiskDataAvailable() {
 				interval := tableShard.Schema.Schema.Config.ArchivingIntervalMinutes * 60
 				delay := tableShard.Schema.Schema.Config.ArchivingDelayMinutes * 60
 				currentCutoff := tableShard.ArchiveStore.CurrentVersion.ArchivingCutoff
@@ -161,6 +161,11 @@ func (job *ArchivingJob) String() string {
 		job.tableName, job.shardID, job.cutoff)
 }
 
+// JobType return job type
+func (job *ArchivingJob) JobType() common.JobType {
+	return common.ArchivingJobType
+}
+
 type backfillJobManager struct {
 	sync.RWMutex
 	// backfillJobDetails for different tables, shard. Key is {tableName}|{shardID}|backfill,
@@ -187,10 +192,11 @@ func (m *backfillJobManager) generateJobs() []Job {
 
 	now := uint32(utils.Now().Unix())
 	var jobs []Job
+
 	for tableName, shardMap := range m.memStore.TableShards {
 		for shardID, tableShard := range shardMap {
 			tableShard.Schema.RLock()
-			if tableShard.Schema.Schema.IsFactTable {
+			if tableShard.Schema.Schema.IsFactTable && tableShard.IsDiskDataAvailable() {
 				key := getIdentifier(tableName, shardID, common.BackfillJobType)
 				backfillMgr := tableShard.LiveStore.BackfillManager
 				if backfillMgr.QualifyToTriggerBackfill() {
@@ -298,6 +304,11 @@ func (job *BackfillJob) String() string {
 		job.tableName, job.shardID)
 }
 
+// JobType return job type
+func (job *BackfillJob) JobType() common.JobType {
+	return common.BackfillJobType
+}
+
 type snapshotJobManager struct {
 	sync.RWMutex
 	// snapshotJobDetails for different tables, shard. Key is {tableName}|{shardID}|snapshot,
@@ -322,10 +333,11 @@ func (m *snapshotJobManager) generateJobs() []Job {
 	m.memStore.RLock()
 	defer m.memStore.RUnlock()
 	var jobs []Job
+
 	for tableName, shardMap := range m.memStore.TableShards {
 		for shardID, tableShard := range shardMap {
 			tableShard.Schema.RLock()
-			if !tableShard.Schema.Schema.IsFactTable {
+			if !tableShard.Schema.Schema.IsFactTable && tableShard.IsDiskDataAvailable() {
 				key := getIdentifier(tableName, shardID, common.SnapshotJobType)
 
 				snapshotManager := tableShard.LiveStore.SnapshotManager
@@ -420,6 +432,11 @@ func (job *SnapshotJob) String() string {
 		job.tableName, job.shardID)
 }
 
+// JobType return job type
+func (job *SnapshotJob) JobType() common.JobType {
+	return common.SnapshotJobType
+}
+
 type purgeJobManager struct {
 	sync.RWMutex
 	// purge job details for different tables, shard. Key is {tableName}|{shardID}|purge,
@@ -447,6 +464,9 @@ func (m *purgeJobManager) generateJobs() []Job {
 	var jobs []Job
 	for tableName, shardMap := range m.memStore.TableShards {
 		for shardID, tableShard := range shardMap {
+			if !tableShard.IsDiskDataAvailable() {
+				continue
+			}
 			retentionDays := tableShard.Schema.Schema.Config.RecordRetentionInDays
 			key := getIdentifier(tableName, shardID, common.PurgeJobType)
 			if tableShard.ArchiveStore.PurgeManager.QualifyForPurge() &&
@@ -530,4 +550,9 @@ func (job *PurgeJob) GetIdentifier() string {
 func (job *PurgeJob) String() string {
 	return fmt.Sprintf("PurgeJob<Table: %s, ShardID: %d>",
 		job.tableName, job.shardID)
+}
+
+// JobType return job type
+func (job *PurgeJob) JobType() common.JobType {
+	return common.PurgeJobType
 }

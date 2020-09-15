@@ -15,7 +15,7 @@
 package query
 
 import (
-	"github.com/uber/aresdb/memutils"
+	"github.com/uber/aresdb/cgoutils"
 	"github.com/uber/aresdb/utils"
 	"strconv"
 	"sync"
@@ -89,7 +89,7 @@ func (p devicePointer) isNull() bool {
 func (p devicePointer) offset(offset int) devicePointer {
 	return devicePointer{
 		device:  p.device,
-		pointer: memutils.MemAccess(p.getPointer(), offset),
+		pointer: utils.MemAccess(p.getPointer(), offset),
 	}
 }
 
@@ -156,11 +156,9 @@ func reportAllocatedMemory(deviceCount int, da deviceAllocator) {
 
 // newDeviceAllocator returns a new device allocator instances.
 func newDeviceAllocator() deviceAllocator {
-	// init may panic and crash the service. This is expected.
-	memutils.Init()
 	var da deviceAllocator
-	deviceCount := memutils.GetDeviceCount()
-	if memutils.IsPooledMemory() {
+	deviceCount := cgoutils.GetDeviceCount()
+	if cgoutils.IsPooledMemory() {
 		utils.GetLogger().Info("Using pooled device memory manager")
 		da = &pooledDeviceAllocatorImpl{}
 	} else {
@@ -198,7 +196,7 @@ func (d *memoryTrackingDeviceAllocatorImpl) deviceAllocate(bytes, device int) de
 	dp := devicePointer{
 		device:    device,
 		bytes:     bytes,
-		pointer:   memutils.DeviceAllocate(bytes, device),
+		pointer:   cgoutils.DeviceAllocate(bytes, device),
 		allocated: true,
 	}
 	atomic.AddInt64(&d.memoryUsage[device], int64(bytes))
@@ -207,7 +205,7 @@ func (d *memoryTrackingDeviceAllocatorImpl) deviceAllocate(bytes, device int) de
 
 // deviceFree frees the specified memory from the device. **Slice bound is not checked!!**
 func (d *memoryTrackingDeviceAllocatorImpl) deviceFree(dp devicePointer) {
-	memutils.DeviceFree(dp.pointer, dp.device)
+	cgoutils.DeviceFree(dp.pointer, dp.device)
 	atomic.AddInt64(&d.memoryUsage[dp.device], int64(-dp.bytes))
 }
 
@@ -227,7 +225,7 @@ func (d *pooledDeviceAllocatorImpl) deviceAllocate(bytes, device int) devicePoin
 	dp := devicePointer{
 		device:    device,
 		bytes:     bytes,
-		pointer:   memutils.DeviceAllocate(bytes, device),
+		pointer:   cgoutils.DeviceAllocate(bytes, device),
 		allocated: true,
 	}
 	return dp
@@ -235,11 +233,11 @@ func (d *pooledDeviceAllocatorImpl) deviceAllocate(bytes, device int) devicePoin
 
 // deviceFree frees the specified memory from the device. **Slice bound is not checked!!**
 func (d *pooledDeviceAllocatorImpl) deviceFree(dp devicePointer) {
-	memutils.DeviceFree(dp.pointer, dp.device)
+	cgoutils.DeviceFree(dp.pointer, dp.device)
 }
 
 // getAllocatedMemory returns memory allocated for a specific device.
 func (d *pooledDeviceAllocatorImpl) getAllocatedMemory(device int) int64 {
-	free, total := memutils.GetDeviceMemoryInfo(device)
+	free, total := cgoutils.GetDeviceMemoryInfo(device)
 	return int64(total - free)
 }

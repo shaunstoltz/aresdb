@@ -16,9 +16,10 @@ package sink
 
 import (
 	"fmt"
+
 	"github.com/uber-go/tally"
 	"github.com/uber/aresdb/client"
-	"github.com/uber/aresdb/gateway"
+	controllerCli "github.com/uber/aresdb/controller/client"
 	"github.com/uber/aresdb/subscriber/common/rules"
 	"github.com/uber/aresdb/subscriber/config"
 	"github.com/uber/aresdb/utils"
@@ -37,18 +38,16 @@ type AresDatabase struct {
 // NewAresDatabase initialize an AresDatabase cluster
 func NewAresDatabase(
 	serviceConfig config.ServiceConfig, jobConfig *rules.JobConfig, cluster string,
-	sinkCfg config.SinkConfig, aresControllerClient gateway.ControllerClient) (Sink, error) {
+	sinkCfg config.SinkConfig, aresControllerClient controllerCli.ControllerClient) (Sink, error) {
 	if sinkCfg.GetSinkMode() != config.Sink_AresDB {
 		return nil, fmt.Errorf("Failed to NewAresDatabase, wrong sinkMode=%d", sinkCfg.GetSinkMode())
 	}
 
-	connector, err := sinkCfg.AresDBConnectorConfig.NewConnector(serviceConfig.Logger.Sugar(), serviceConfig.Scope.Tagged(map[string]string{
+	connector := sinkCfg.AresDBConnectorConfig.NewConnector(serviceConfig.Logger.Sugar(), serviceConfig.Scope.Tagged(map[string]string{
 		"job":         jobConfig.Name,
 		"aresCluster": cluster,
 	}))
-	if err != nil {
-		return nil, utils.StackError(err, "failed to create ares connector")
-	}
+
 	return &AresDatabase{
 		ServiceConfig: serviceConfig,
 		JobConfig:     jobConfig,
@@ -62,7 +61,9 @@ func NewAresDatabase(
 }
 
 // Shutdown will clean up resources that needs to be cleaned up
-func (db *AresDatabase) Shutdown() {}
+func (db *AresDatabase) Shutdown() {
+	db.Connector.Close()
+}
 
 // Save saves a batch of row objects into a destination
 func (db *AresDatabase) Save(destination Destination, rows []client.Row) error {

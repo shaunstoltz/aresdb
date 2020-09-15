@@ -17,8 +17,10 @@ package query
 import (
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	aresdbCommon "github.com/uber/aresdb/common"
 	"github.com/uber/aresdb/memstore"
-	"github.com/uber/aresdb/query/common"
+	"github.com/uber/aresdb/memstore/common"
+	queryCom "github.com/uber/aresdb/query/common"
 	"github.com/uber/aresdb/query/expr"
 	"github.com/uber/aresdb/utils"
 	"sync"
@@ -41,7 +43,7 @@ var _ = ginkgo.Describe("device_manager", func() {
 				QueryCount:           queryCounts[device],
 				TotalAvailableMemory: 3000,
 				FreeMemory:           freeMemory[device],
-				QueryMemoryUsageMap:  make(map[*AQLQuery]int, 0),
+				QueryMemoryUsageMap:  make(map[*queryCom.AQLQuery]int, 0),
 			}
 			deviceInfoArray[device] = &deviceInfo
 		}
@@ -65,7 +67,7 @@ var _ = ginkgo.Describe("device_manager", func() {
 
 	ginkgo.It("leastMemStrategy should work", func() {
 		deviceManager.strategy = leastMemStrategy
-		queries := [5]*AQLQuery{{}, {}, {}, {}}
+		queries := [5]*queryCom.AQLQuery{{}, {}, {}, {}}
 		devices := [5]int{}
 		// case 1: w/o device hint, return the device w/ least query count.
 		devices[0] = deviceManager.findDevice(queries[0], 1000, -1)
@@ -125,7 +127,7 @@ var _ = ginkgo.Describe("device_manager", func() {
 					QueryCount:           0,
 					TotalAvailableMemory: 1000,
 					FreeMemory:           500,
-					QueryMemoryUsageMap:  make(map[*AQLQuery]int, 0),
+					QueryMemoryUsageMap:  make(map[*queryCom.AQLQuery]int, 0),
 				},
 			},
 			Timeout:            5,
@@ -139,7 +141,7 @@ var _ = ginkgo.Describe("device_manager", func() {
 		deviceManager.strategy = leastQueryCountAndMemStrategy
 		deviceManager.deviceAvailable = sync.NewCond(deviceManager)
 
-		queries := [3]*AQLQuery{{}, {}, {}}
+		queries := [3]*queryCom.AQLQuery{{}, {}, {}}
 		devices := [4]int{}
 		timeout := 3
 
@@ -191,15 +193,12 @@ var _ = ginkgo.Describe("device_manager", func() {
 	})
 
 	ginkgo.It("estimate memory usage", func() {
-		testFactory := memstore.TestFactoryT{
-			RootPath:   "../testing/data",
-			FileSystem: utils.OSFileSystem{},
-		}
+		testFactory := memstore.GetFactory()
 		batch110, err := testFactory.ReadLiveBatch("archiving/batch-110")
 		Ω(err).Should(BeNil())
 		liveBatch := &memstore.LiveBatch{
 			Capacity: 5,
-			Batch: memstore.Batch{
+			Batch: common.Batch{
 				RWMutex: &sync.RWMutex{},
 				Columns: batch110.Columns,
 			},
@@ -208,7 +207,7 @@ var _ = ginkgo.Describe("device_manager", func() {
 		batchArchive0, err := testFactory.ReadArchiveBatch("archiving/archiveBatch0")
 		Ω(err).Should(BeNil())
 		archiveBatch := &memstore.ArchiveBatch{
-			Batch: memstore.Batch{
+			Batch: common.Batch{
 				RWMutex: &sync.RWMutex{},
 				Columns: batchArchive0.Columns,
 			},
@@ -216,6 +215,9 @@ var _ = ginkgo.Describe("device_manager", func() {
 		}
 
 		qc := AQLQueryContext{
+			Query: &queryCom.AQLQuery{
+				Limit: 1000000,
+			},
 			TableScanners: []*TableScanner{
 				{
 					Columns: []int{0, 2, 1},
@@ -228,7 +230,7 @@ var _ = ginkgo.Describe("device_manager", func() {
 				},
 			},
 			OOPK: OOPKContext{
-				NumDimsPerDimWidth: common.DimCountsPerDimWidth{0, 0, 1, 0, 0},
+				NumDimsPerDimWidth: queryCom.DimCountsPerDimWidth{0, 0, 1, 0, 0},
 				DimRowBytes:        5,
 				MeasureBytes:       4,
 				foreignTables:      []*foreignTable{{}},
@@ -304,16 +306,32 @@ var _ = ginkgo.Describe("device_manager", func() {
 		memUsage = estimateSortReduceMemUsage(20)
 		Ω(memUsage).Should(Equal(720))
 
-		// batch processing
-		memUsage = qc.estimateMemUsageForBatch(20, 128+128+128)
-		Ω(memUsage).Should(Equal(1204))
+		// batch processing non-aggregate query
+		qc.IsNonAggregationQuery = true
+		memUsage = qc.estimateMemUsageForBatch(20, 128+128+128, 40)
+		Ω(memUsage).Should(Equal(1404))
+		qc.Query.Limit = 10
+		memUsage = qc.estimateMemUsageForBatch(20, 128+128+128, 40)
+		Ω(memUsage).Should(Equal(1404))
+
+		// batch processing aggregate query
+		qc.IsNonAggregationQuery = false
+		memUsage = qc.estimateMemUsageForBatch(20, 128+128+128, 40)
+		Ω(memUsage).Should(Equal(1684))
 
 		// live batch columns + processing
 		memUsage = qc.estimateLiveBatchMemoryUsage(liveBatch)
-		Ω(memUsage).Should(Equal(589))
+		Ω(memUsage).Should(Equal(709))
 
 		// archive batch columns + processing
 		memUsage = qc.estimateArchiveBatchMemoryUsage(archiveBatch, false)
-		Ω(memUsage).Should(Equal(489))
+		Ω(memUsage).Should(Equal(513))
+	})
+
+	ginkgo.It("NewDeviceManager should work", func() {
+		Ω(NewDeviceManager(aresdbCommon.QueryConfig{
+			DeviceMemoryUtilization: 0.8,
+			DeviceChoosingTimeout:   -1,
+		})).ShouldNot(BeNil())
 	})
 })

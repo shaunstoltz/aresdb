@@ -24,8 +24,8 @@
 #include <cmath>
 #include <functional>
 #include <tuple>
-#include "query/memory.hpp"
-#include "query/utils.hpp"
+#include "memory.hpp"
+#include "utils.hpp"
 
 typedef typename thrust::host_vector<unsigned char>::iterator charIter;
 typedef typename thrust::host_vector<uint32_t>::iterator UInt32Iter;
@@ -110,6 +110,21 @@ inline int align_offset(int offset, int alignment) {
   return (offset + alignment - 1) / alignment * alignment;
 }
 
+// allocate_raw allocate bytes of memory from gpu/cpu with 0 values filled
+// The return pointer must be released by caller
+inline uint8_t * allocate_raw(int bytes) {
+  uint8_t *ptr;
+  int totalBytes = align_offset(bytes, 8);
+#ifdef RUN_ON_DEVICE
+  ares::deviceMalloc(reinterpret_cast<void **>(&ptr), totalBytes);
+  ares::deviceMemset(ptr, 0, bytes);
+#else
+  ptr = reinterpret_cast<uint8_t *>(malloc(totalBytes));
+  memset(ptr, 0, bytes);
+#endif
+  return ptr;
+}
+
 // Pointer returned by this function must be released by caller. Pointers
 // will be aligned by 8 bytes. Note if it's scratch space, values comes
 // before nulls. So 5th parameter should be values bytes and 6th parameter
@@ -159,6 +174,28 @@ allocate_column(uint32_t *counts,
   return ptr;
 }
 
+inline uint8_t *
+allocate_array_column(uint8_t* offsetLength, uint8_t* values,
+        int length, int valueBytes) {
+  uint8_t * ptr;
+  int offsetLengthBytes = length * 8;
+  int totalBytes = offsetLengthBytes + valueBytes;
+
+#ifdef RUN_ON_DEVICE
+  ares::deviceMalloc(reinterpret_cast<void **>(&ptr), totalBytes);
+  cudaMemcpy(ptr, offsetLength, offsetLengthBytes, cudaMemcpyHostToDevice);
+  CheckCUDAError("cudaMemcpy offsetLength");
+  cudaMemcpy(ptr + offsetLengthBytes, values,
+        valueBytes, cudaMemcpyHostToDevice);
+  CheckCUDAError("cudaMemcpy values");
+#else
+  ptr = reinterpret_cast<uint8_t *>(malloc(totalBytes));
+  memcpy(ptr, offsetLength, offsetLengthBytes);
+  memcpy(ptr + offsetLengthBytes, values, valueBytes);
+#endif
+  return ptr;
+}
+
 template<typename V, typename CmpFunc>
 inline bool equal(V *resBegin, V *resEnd, V *expectedBegin, CmpFunc f) {
 #ifdef RUN_ON_DEVICE
@@ -188,6 +225,15 @@ inline bool equal_print(V *resBegin, V *resEnd, V *expectedBegin, CmpFunc f) {
 #ifdef RUN_ON_DEVICE
   thrust::host_vector<V> expectedH(expectedBegin, expectedBegin + size);
   thrust::device_vector<V> expectedV = expectedH;
+  thrust::device_vector<V> actualD(resBegin, resEnd);
+  thrust::device_vector<V> actualH = actualD;
+  std::cout << "result:" << std::endl;
+  std::ostream_iterator<int > out_it(std::cout, ", ");
+  std::copy(actualH.begin(), actualH.end(), out_it);
+  std::cout << std::endl;
+  std::cout << "expected:" << std::endl;
+  std::copy(expectedH.begin(), expectedH.end(), out_it);
+  std::cout << std::endl;
   return thrust::equal(thrust::device, resBegin, resEnd, expectedV.begin(), f);
 #else
   std::cout << "result:" << std::endl;
@@ -257,6 +303,16 @@ inline GeoShape get_geo_shape(const float *shapeLatH,
 template<typename V>
 inline void release(V* devPtr) {
   ares::deviceFree(devPtr);
+}
+
+template<typename V>
+inline void copy_device_to_host(V* dst, V* src, size_t size) {
+  size_t totalSize = size * sizeof(V);
+  ares::asyncCopyDeviceToHost(reinterpret_cast<void *>(dst),
+                              reinterpret_cast<void *>(src),
+                              totalSize,
+                              0);
+  ares::waitForCudaStream(0);
 }
 
 inline void release(GeoShapeBatch shapes) {

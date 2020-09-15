@@ -20,6 +20,7 @@ import (
 	"github.com/uber-go/tally"
 	"github.com/uber/aresdb/client"
 	"github.com/uber/aresdb/client/mocks"
+	"github.com/uber/aresdb/controller/models"
 	memCom "github.com/uber/aresdb/memstore/common"
 	"github.com/uber/aresdb/subscriber/common/rules"
 	"github.com/uber/aresdb/subscriber/config"
@@ -53,7 +54,7 @@ var _ = Describe("AresDatabase client", func() {
 		Scope:  tally.NoopScope,
 	}
 	jobConfig := rules.JobConfig{
-		Name: "test",
+		JobConfig: models.JobConfig{Name: "test"},
 	}
 	aresDB := &AresDatabase{
 		ServiceConfig: serviceConfig,
@@ -71,7 +72,7 @@ var _ = Describe("AresDatabase client", func() {
 			AresDBConnectorConfig: cfg,
 		}
 		_, err := NewAresDatabase(serviceConfig, &jobConfig, cluster, sinkCfg, nil)
-		Ω(err).ShouldNot(BeNil())
+		Ω(err).Should(BeNil())
 	})
 	It("Save", func() {
 		mockConnector.On("Insert",

@@ -19,6 +19,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/mock"
+	"github.com/uber/aresdb/memstore/common"
 	"github.com/uber/aresdb/metastore/mocks"
 )
 
@@ -38,11 +39,15 @@ func (j *countJob) String() string {
 	return "count"
 }
 
+func (j *countJob) JobType() common.JobType {
+	return "count"
+}
+
 var _ = ginkgo.Describe("scheduler", func() {
 	var counter int
 
 	mockErr := errors.New("UpdateArchivingCutoff fails")
-	m := getFactory().NewMockMemStore()
+	m := GetFactory().NewMockMemStore()
 	(m.metaStore).(*mocks.MetaStore).On(
 		"UpdateArchivingCutoff", mock.Anything, mock.Anything, mock.Anything).Return(mockErr)
 
@@ -62,7 +67,7 @@ var _ = ginkgo.Describe("scheduler", func() {
 		scheduler.Start()
 		for i := 0; i < 10; i++ {
 			expectedCount := i + 1
-			resChan := scheduler.SubmitJob(&countJob{
+			_, resChan := scheduler.SubmitJob(&countJob{
 				jobFunc: func() error {
 					counter++
 					if counter != expectedCount {
@@ -75,5 +80,23 @@ var _ = ginkgo.Describe("scheduler", func() {
 			Ω(err).Should(BeNil())
 		}
 		scheduler.Stop()
+	})
+
+	ginkgo.It("Test scheduler jobtype enable", func() {
+		scheduler := newScheduler(m)
+		Ω(scheduler).Should(Not(BeNil()))
+		Ω(scheduler.IsJobTypeEnabled(common.ArchivingJobType)).Should(Equal(true))
+		Ω(scheduler.IsJobTypeEnabled(common.BackfillJobType)).Should(Equal(true))
+		Ω(scheduler.IsJobTypeEnabled(common.BackfillJobType)).Should(Equal(true))
+		Ω(scheduler.IsJobTypeEnabled(common.PurgeJobType)).Should(Equal(true))
+
+		scheduler.EnableJobType(common.ArchivingJobType, false)
+
+		Ω(scheduler.IsJobTypeEnabled(common.ArchivingJobType)).Should(Equal(false))
+		Ω(scheduler.IsJobTypeEnabled(common.BackfillJobType)).Should(Equal(true))
+
+		scheduler.EnableJobType(common.ArchivingJobType, true)
+		Ω(scheduler.IsJobTypeEnabled(common.ArchivingJobType)).Should(Equal(true))
+		Ω(scheduler.IsJobTypeEnabled(common.BackfillJobType)).Should(Equal(true))
 	})
 })

@@ -17,6 +17,7 @@ package common
 import (
 	"github.com/uber/aresdb/diskstore"
 	"io"
+	"os"
 	"unsafe"
 )
 
@@ -42,10 +43,12 @@ const (
 // HostVectorPartySlice stores pointers to data for a column in host memory.
 // And its start index and Bytes
 type HostVectorPartySlice struct {
+	// Values will be shared between normal data type and array data type
 	Values unsafe.Pointer
 	Nulls  unsafe.Pointer
 	// The length of the count vector is Length+1
-	Counts       unsafe.Pointer
+	Counts unsafe.Pointer
+
 	Length       int
 	ValueType    DataType
 	DefaultValue DataValue
@@ -54,14 +57,31 @@ type HostVectorPartySlice struct {
 	NullStartIndex  int
 	CountStartIndex int
 
+	// ValueBytes is byte count of Values field
 	ValueBytes int
 	NullBytes  int
 	CountBytes int
+
+	// used only for Array type to point to offset/length buffer
+	// offset byte count = 8 * length
+	Offsets unsafe.Pointer
+	// ValueOffsetAdjust is value pointer adjustment for array archive vector party due to
+	// slice operation, because the offsetLength is still using the original offset value before slice operation
+	ValueOffsetAdjust int
 }
 
 // ValueCountsUpdateMode represents the way we update value counts when we are writing values to
 // vector parties.
 type ValueCountsUpdateMode int
+
+const (
+	// IgnoreCount skip setting value counts.
+	IgnoreCount ValueCountsUpdateMode = iota
+	// IncrementCount only increment count.
+	IncrementCount
+	// CheckExistingCount also check existing count.
+	CheckExistingCount
+)
 
 // SlicedVector is vector party data represented into human-readable slice format
 // consists of a value slice and count slice,
@@ -88,7 +108,7 @@ type VectorPartySerializer interface {
 
 // VectorParty interface
 type VectorParty interface {
-	// Allocate allocate underlying storage for vector party
+	//   allocate underlying storage for vector party
 	Allocate(hasCount bool)
 
 	// GetValidity get validity of given offset.
@@ -128,6 +148,14 @@ type VectorParty interface {
 	Equals(other VectorParty) bool
 	// GetNonDefaultValueCount get Number of non-default values stored
 	GetNonDefaultValueCount() int
+	// IsList tells whether it's a list vector party or not
+	IsList() bool
+	// AsList returns ListVectorParty representation of this vector party.
+	// Caller should always call IsList before conversion, otherwise panic may happens
+	// for incompatible vps.
+	AsList() ListVectorParty
+	// Dump is for testing purpose
+	Dump(file *os.File)
 }
 
 // CVectorParty is vector party that is backed by c
@@ -193,4 +221,22 @@ type ArchiveVectorParty interface {
 	SliceByValue(lowerBoundRow, upperBoundRow int, value unsafe.Pointer) (startRow int, endRow int, startIndex int, endIndex int)
 	// Slice vector party to get [startIndex, endIndex) based on [lowerBoundRow, upperBoundRow)
 	SliceIndex(lowerBoundRow, upperBoundRow int) (startIndex, endIndex int)
+}
+
+// ListVectorParty is the interface for list vector party to read and write list value.
+type ListVectorParty interface {
+	// GetElemCount is to get count of elements of n-th element in the VP
+	GetElemCount(row int) uint32
+	// GetListValue is to get the raw value of n-th element in the VP
+	GetListValue(row int) (unsafe.Pointer, bool)
+	// SetListValue is to set value for n-th element in the VP
+	SetListValue(row int, val unsafe.Pointer, valid bool)
+}
+
+// VectorPartyEquals covers nil VectorParty compare
+func VectorPartyEquals(v1 VectorParty, v2 VectorParty) bool {
+	if v1 == nil || v2 == nil {
+		return v1 == nil && v2 == nil
+	}
+	return v1.Equals(v2)
 }

@@ -18,9 +18,10 @@ import (
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	memCom "github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/memutils"
 	queryCom "github.com/uber/aresdb/query/common"
 	"github.com/uber/aresdb/query/expr"
+	"github.com/uber/aresdb/utils"
+	"net/http/httptest"
 	"time"
 	"unsafe"
 )
@@ -28,13 +29,14 @@ import (
 var _ = ginkgo.Describe("AQL postprocessor", func() {
 	ginkgo.It("works on empty result", func() {
 		ctx := &AQLQueryContext{}
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{}))
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{}))
 	})
 
 	ginkgo.It("works on one dimension and one row", func() {
 		ctx := &AQLQueryContext{
-			Query: &AQLQuery{
-				Dimensions: []Dimension{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
 					{Expr: ""},
 				},
 			},
@@ -59,16 +61,17 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}
 
 		ctx.OOPK = oopkContext
-
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"12": float64(float32(3.2)),
 		}))
 	})
 
 	ginkgo.It("works on two dimensions and two rows", func() {
 		ctx := &AQLQueryContext{
-			Query: &AQLQuery{
-				Dimensions: []Dimension{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
 					{Expr: ""},
 					{Expr: ""},
 				},
@@ -101,7 +104,9 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}
 
 		ctx.OOPK = oopkContext
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"two": map[string]interface{}{
 				"12":   float64(float32(3.2)),
 				"NULL": float64(float32(6.4)),
@@ -111,8 +116,8 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 
 	ginkgo.It("works on float dimension and nil measure", func() {
 		ctx := &AQLQueryContext{
-			Query: &AQLQuery{
-				Dimensions: []Dimension{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
 					{Expr: ""},
 				},
 			},
@@ -139,21 +144,23 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 
 		ctx.OOPK = oopkContext
 		*(*float32)(oopkContext.dimensionVectorH) = 3.2
-		*(*uint8)(memutils.MemAccess(oopkContext.dimensionVectorH, 4)) = 1
+		*(*uint8)(utils.MemAccess(oopkContext.dimensionVectorH, 4)) = 1
 
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"3.2": nil,
 		}))
 	})
 
 	ginkgo.It("works for non agg queries", func() {
 		ctx := &AQLQueryContext{
-			Query: &AQLQuery{
-				Dimensions: []Dimension{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
 					{Expr: "someField"},
 				},
 			},
-			isNonAggregationQuery: true,
+			IsNonAggregationQuery: true,
 		}
 		oopkContext := OOPKContext{
 			Dimensions: []expr.Expr{
@@ -173,17 +180,20 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 
 		ctx.OOPK = oopkContext
 		*(*float32)(oopkContext.dimensionVectorH) = 3.2
-		*(*uint8)(memutils.MemAccess(oopkContext.dimensionVectorH, 4)) = 1
+		*(*uint8)(utils.MemAccess(oopkContext.dimensionVectorH, 4)) = 1
 
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
-			"headers":    []string{"someField"},
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(BeNil())
+		ctx.flushResultBuffer()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"matrixData": [][]interface{}{{"3.2"}},
 		}))
 	})
 
 	ginkgo.It("time Unit formatting works", func() {
-		query := &AQLQuery{
-			Dimensions: []Dimension{
+		query := &queryCom.AQLQuery{
+			Dimensions: []queryCom.Dimension{
 				{
 					TimeBucketizer: "h",
 				},
@@ -221,14 +231,18 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}
 
 		ctx.OOPK = oopkContext
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"1970-01-01 00:00": map[string]interface{}{
 				"2": 6.400000095367432,
 			},
 		}))
 
 		ctx.Query.Dimensions[0].TimeBucketizer = "time of day"
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.Results = nil
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"00:03": map[string]interface{}{
 				"2": float64(float32(3.2)),
 			},
@@ -238,14 +252,18 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}))
 
 		ctx.Query.Dimensions[0].TimeBucketizer = "hour of day"
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.Results = nil
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"00:00": map[string]interface{}{
 				"2": 6.400000095367432,
 			},
 		}))
 
 		ctx.Query.Dimensions[0].TimeBucketizer = "hour of week"
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.Results = nil
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"Monday 00:03": map[string]interface{}{
 				"2": float64(float32(3.2)),
 			},
@@ -255,7 +273,9 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}))
 
 		ctx.Query.Dimensions[0].TimeBucketizer = "minute"
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.Results = nil
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"1970-01-01 00:03": map[string]interface{}{
 				"2": float64(float32(3.2)),
 			},
@@ -265,14 +285,18 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}))
 
 		ctx.Query.Dimensions[0].TimeBucketizer = "hour"
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.Results = nil
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"1970-01-01 00:00": map[string]interface{}{
 				"2": 6.400000095367432,
 			},
 		}))
 
 		ctx.Query.Dimensions[0].TimeBucketizer = "some invalid bucketizer"
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.Results = nil
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"190": map[string]interface{}{
 				"2": float64(float32(3.2)),
 			},
@@ -283,7 +307,9 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 
 		ctx.OOPK.dimensionVectorH = unsafe.Pointer(&[]uint8{1, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 1, 1, 1}[0])
 		ctx.Query.Dimensions[0].TimeBucketizer = "day of week"
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.Results = nil
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"Tuesday": map[string]interface{}{
 				"2": float64(float32(3.2)),
 			},
@@ -295,8 +321,8 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 	})
 
 	ginkgo.It("time dimension remedy should work", func() {
-		query := &AQLQuery{
-			Dimensions: []Dimension{
+		query := &queryCom.AQLQuery{
+			Dimensions: []queryCom.Dimension{
 				{
 					Expr:           "reqeust_at",
 					TimeBucketizer: "d",
@@ -306,7 +332,7 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 					Expr: "1",
 				},
 			},
-			TimeFilter: TimeFilter{
+			TimeFilter: queryCom.TimeFilter{
 				Column: "request_at",
 				From:   "-1d",
 				To:     "0d",
@@ -351,7 +377,9 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}
 
 		ctx.OOPK = oopkContext
-		Ω(ctx.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
 			"25612": map[string]interface{}{
 				"2": float64(float32(3.2)),
 			},
@@ -361,7 +389,9 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 		}))
 
 		ctx1.OOPK = oopkContext
-		Ω(ctx1.Postprocess()).Should(Equal(queryCom.AQLQueryResult{
+		ctx1.initResultFlushContext()
+		ctx1.Postprocess()
+		Ω(ctx1.Results).Should(Equal(queryCom.AQLQueryResult{
 			"22012": map[string]interface{}{
 				"2": float64(float32(3.2)),
 			},
@@ -373,22 +403,263 @@ var _ = ginkgo.Describe("AQL postprocessor", func() {
 
 	ginkgo.It("readMeasure should work", func() {
 		// read an 8 bytes int64
-		measureVectorInt := [1]int64{1}
+		measureVectorInt64 := [1]int64{1}
 		measureAST := &expr.NumberLiteral{
 			ExprType: expr.Signed,
 		}
 
-		measureVal := readMeasure(unsafe.Pointer(&measureVectorInt[0]), measureAST, 8)
+		measureVal := readMeasure(unsafe.Pointer(&measureVectorInt64[0]), measureAST, 8)
 		Ω(measureVal).ShouldNot(BeNil())
 		Ω(*measureVal).Should(Equal(1.0))
 
-		// read a 4 bytes float
-		measureVectorFloat := [2]float32{1.0, 0}
+		// read an 8 bytes uint64
+		measureVectorUint64 := [1]uint64{1 << 33}
+		measureAST = &expr.NumberLiteral{
+			ExprType: expr.Unsigned,
+		}
+
+		measureVal = readMeasure(unsafe.Pointer(&measureVectorUint64[0]), measureAST, 8)
+		Ω(measureVal).ShouldNot(BeNil())
+		Ω(*measureVal).Should(Equal(8.589934592e+09))
+
+		// read an 8 bytes float64
+		measureVectorFloat64 := [1]float64{2.0}
 		measureAST = &expr.NumberLiteral{
 			ExprType: expr.Float,
 		}
-		measureVal = readMeasure(unsafe.Pointer(&measureVectorFloat[0]), measureAST, 4)
+
+		measureVal = readMeasure(unsafe.Pointer(&measureVectorFloat64[0]), measureAST, 8)
+		Ω(measureVal).ShouldNot(BeNil())
+		Ω(*measureVal).Should(Equal(2.0))
+
+		// read a 4 bytes float
+		measureVectorFloat32 := [2]float32{1.0, 0}
+		measureAST = &expr.NumberLiteral{
+			ExprType: expr.Float,
+		}
+		measureVal = readMeasure(unsafe.Pointer(&measureVectorFloat32[0]), measureAST, 4)
 		Ω(measureVal).ShouldNot(BeNil())
 		Ω(*measureVal).Should(BeEquivalentTo(1.0))
+
+		// read a 4 bytes int32
+		measureVectorInt32 := [2]int32{1, 2}
+		measureAST = &expr.NumberLiteral{
+			ExprType: expr.Signed,
+		}
+		measureVal = readMeasure(unsafe.Pointer(&measureVectorInt32[0]), measureAST, 4)
+		Ω(measureVal).ShouldNot(BeNil())
+		Ω(*measureVal).Should(BeEquivalentTo(1))
+
+		// read a 4 bytes uint32
+		measureVectorUint32 := [2]uint32{1, 2}
+		measureAST = &expr.NumberLiteral{
+			ExprType: expr.Unsigned,
+		}
+		measureVal = readMeasure(unsafe.Pointer(&measureVectorUint32[0]), measureAST, 4)
+		Ω(measureVal).ShouldNot(BeNil())
+		Ω(*measureVal).Should(BeEquivalentTo(1))
+	})
+
+	ginkgo.It("works for eager flushing non agg queries", func() {
+		w := httptest.NewRecorder()
+		ctx := &AQLQueryContext{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
+					{Expr: "someField"},
+				},
+			},
+			IsNonAggregationQuery: true,
+			ResponseWriter:        w,
+		}
+		oopkContext := OOPKContext{
+			Dimensions: []expr.Expr{
+				&expr.VarRef{
+					ExprType: expr.Float,
+					DataType: memCom.Float32,
+				},
+			},
+			DimRowBytes:        5,
+			NumDimsPerDimWidth: queryCom.DimCountsPerDimWidth{0, 0, 1, 0, 0},
+			DimensionVectorIndex: []int{
+				0,
+			},
+			ResultSize:       1,
+			dimensionVectorH: unsafe.Pointer(&[]uint8{0, 0, 0, 0, 0}[0]),
+		}
+
+		ctx.OOPK = oopkContext
+		*(*float32)(oopkContext.dimensionVectorH) = 3.2
+		*(*uint8)(utils.MemAccess(oopkContext.dimensionVectorH, 4)) = 1
+
+		ctx.initResultFlushContext()
+		ctx.flushResultBuffer()
+		Ω(w.Body.String()).Should(Equal(`["3.2"]`))
+		Ω(ctx.resultFlushContext.rowsFlushed).Should(Equal(1))
+
+		ctx.flushResultBuffer()
+		Ω(w.Body.String()).Should(Equal(`["3.2"],["3.2"]`))
+	})
+
+	ginkgo.It("works with enum on data only mode agg", func() {
+		ctx := &AQLQueryContext{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
+					{Expr: ""},
+					{Expr: ""},
+				},
+			},
+			DataOnly: true,
+		}
+		oopkContext := OOPKContext{
+			Dimensions: []expr.Expr{
+				&expr.VarRef{
+					ExprType:        expr.Unsigned,
+					DataType:        memCom.BigEnum,
+					EnumReverseDict: []string{"zero", "one", "two"},
+				},
+				&expr.NumberLiteral{
+					ExprType: expr.Signed,
+				},
+			},
+			Measure: &expr.NumberLiteral{
+				ExprType: expr.Float,
+			},
+			MeasureBytes:       4,
+			DimRowBytes:        8,
+			NumDimsPerDimWidth: queryCom.DimCountsPerDimWidth{0, 0, 1, 1, 0},
+			DimensionVectorIndex: []int{
+				1,
+				0,
+			},
+			ResultSize:       2,
+			dimensionVectorH: unsafe.Pointer(&[]uint8{12, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 1, 0, 1, 1}[0]),
+			measureVectorH:   unsafe.Pointer(&[]float32{3.2, 6.4}[0]),
+		}
+
+		ctx.OOPK = oopkContext
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
+			"2": map[string]interface{}{
+				"12":   float64(float32(3.2)),
+				"NULL": float64(float32(6.4)),
+			},
+		}))
+	})
+
+	ginkgo.It("works with enum on data only mode non agg", func() {
+		w := httptest.NewRecorder()
+		ctx := &AQLQueryContext{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
+					{Expr: "someField"},
+					{Expr: "someField"},
+				},
+			},
+			IsNonAggregationQuery: true,
+			ResponseWriter:        w,
+			DataOnly:              true,
+		}
+		oopkContext := OOPKContext{
+			Dimensions: []expr.Expr{
+				&expr.VarRef{
+					ExprType:        expr.Unsigned,
+					DataType:        memCom.BigEnum,
+					EnumReverseDict: []string{"zero", "one", "two"},
+				},
+				&expr.NumberLiteral{
+					ExprType: expr.Signed,
+				},
+			},
+			DimRowBytes:        8,
+			NumDimsPerDimWidth: queryCom.DimCountsPerDimWidth{0, 0, 1, 1, 0},
+			DimensionVectorIndex: []int{
+				1,
+				0,
+			},
+			ResultSize:       2,
+			dimensionVectorH: unsafe.Pointer(&[]uint8{12, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 1, 0, 1, 1}[0]),
+		}
+
+		ctx.OOPK = oopkContext
+
+		ctx.initResultFlushContext()
+		ctx.flushResultBuffer()
+		Ω(w.Body.String()).Should(Equal(`["2","12"],["2","NULL"]`))
+		Ω(ctx.resultFlushContext.rowsFlushed).Should(Equal(2))
+
+		ctx.flushResultBuffer()
+		Ω(w.Body.String()).Should(Equal(`["2","12"],["2","NULL"],["2","12"],["2","NULL"]`))
+	})
+
+	ginkgo.It("ResultsRowsFlushed should work", func() {
+		qc := AQLQueryContext{
+			IsNonAggregationQuery: true,
+			resultFlushContext: resultFlushContext{
+				rowsFlushed: 100,
+			},
+			OOPK: OOPKContext{
+				ResultSize: 10,
+			},
+		}
+		Ω(qc.ResultsRowsFlushed()).Should(Equal(100))
+
+		qc.IsNonAggregationQuery = false
+		Ω(qc.ResultsRowsFlushed()).Should(Equal(10))
+	})
+
+	ginkgo.It("array element_at in dimension should work", func() {
+		ctx := &AQLQueryContext{
+			Query: &queryCom.AQLQuery{
+				Dimensions: []queryCom.Dimension{
+					{Expr: ""},
+					{Expr: ""},
+				},
+			},
+		}
+		oopkContext := OOPKContext{
+			Dimensions: []expr.Expr{
+				&expr.BinaryExpr{
+					Op: expr.ARRAY_ELEMENT_AT,
+					LHS: &expr.VarRef{
+						ExprType:        expr.Unsigned,
+						DataType:        memCom.BigEnum,
+						EnumReverseDict: []string{"zero", "one", "two"},
+					},
+					RHS: &expr.NumberLiteral{
+						Int: 1,
+					},
+					ExprType: expr.Unsigned,
+				},
+				&expr.NumberLiteral{
+					ExprType: expr.Signed,
+				},
+			},
+			Measure: &expr.NumberLiteral{
+				ExprType: expr.Float,
+			},
+			MeasureBytes:       4,
+			DimRowBytes:        8,
+			NumDimsPerDimWidth: queryCom.DimCountsPerDimWidth{0, 0, 1, 1, 0},
+			DimensionVectorIndex: []int{
+				1,
+				0,
+			},
+			ResultSize:       2,
+			dimensionVectorH: unsafe.Pointer(&[]uint8{12, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 1, 0, 1, 1}[0]),
+			measureVectorH:   unsafe.Pointer(&[]float32{3.2, 6.4}[0]),
+		}
+
+		ctx.OOPK = oopkContext
+		ctx.initResultFlushContext()
+		ctx.Postprocess()
+		Ω(ctx.Results).Should(Equal(queryCom.AQLQueryResult{
+			"two": map[string]interface{}{
+				"12": float64(float32(3.2)),
+			},
+			"one": map[string]interface{}{
+				"NULL": float64(float32(6.4)),
+			},
+		}))
 	})
 })

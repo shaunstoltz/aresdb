@@ -1,3 +1,17 @@
+//  Copyright (c) 2017-2018 Uber Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package metastore
 
 import (
@@ -71,21 +85,17 @@ func (v tableSchemaValidatorImpl) validateIndividualSchema(table *common.Table, 
 	for columnID, column := range table.Columns {
 		if !column.Deleted {
 			nonDeletedColumnsCount++
-		} else {
-			if creation {
-				return ErrNewColumnWithDeletion
-			}
 		}
 		if colNameDedup[column.Name] {
-			return ErrDuplicatedColumnName
+			return common.ErrDuplicatedColumnName
 		}
 		colNameDedup[column.Name] = true
 
 		// validate data type
 		if dataType := memCom.DataTypeFromString(column.Type); dataType == memCom.Unknown {
-			return ErrInvalidDataType
+			return common.ErrInvalidDataType
 		} else if table.IsFactTable && columnID == 0 && dataType != memCom.Uint32 {
-			return ErrMissingTimeColumn
+			return common.ErrMissingTimeColumn
 		}
 
 		// validate hll config
@@ -95,16 +105,16 @@ func (v tableSchemaValidatorImpl) validateIndividualSchema(table *common.Table, 
 
 		// time column does not allow hll config
 		if table.IsFactTable && columnID == 0 && column.HLLConfig.IsHLLColumn {
-			return ErrTimeColumnDoesNotAllowHLLConfig
+			return common.ErrTimeColumnDoesNotAllowHLLConfig
 		}
 
 		if column.DefaultValue != nil {
 			if table.IsFactTable && columnID == 0 {
-				return ErrTimeColumnDoesNotAllowDefault
+				return common.ErrTimeColumnDoesNotAllowDefault
 			}
 
 			if column.HLLConfig.IsHLLColumn {
-				return ErrHLLColumnDoesNotAllowDefaultValue
+				return common.ErrHLLColumnDoesNotAllowDefaultValue
 			}
 
 			err = ValidateDefaultValue(*column.DefaultValue, column.Type)
@@ -114,23 +124,27 @@ func (v tableSchemaValidatorImpl) validateIndividualSchema(table *common.Table, 
 		}
 	}
 	if nonDeletedColumnsCount == 0 {
-		return ErrAllColumnsInvalid
+		return common.ErrAllColumnsInvalid
 	}
 
 	if len(table.PrimaryKeyColumns) == 0 {
-		return ErrMissingPrimaryKey
+		return common.ErrMissingPrimaryKey
 	}
 
 	colIdDedup = make([]bool, len(table.Columns))
 	for _, colId := range table.PrimaryKeyColumns {
 		if colId >= len(table.Columns) {
-			return ErrColumnNonExist
+			return common.ErrColumnNonExist
 		}
 		if table.Columns[colId].Deleted {
-			return ErrColumnDeleted
+			return common.ErrColumnDeleted
 		}
 		if colIdDedup[colId] {
-			return ErrDuplicatedColumn
+			return common.ErrDuplicatedColumn
+		}
+		colDataType := memCom.DataTypeFromString(table.Columns[colId].Type)
+		if memCom.IsArrayType(colDataType) {
+			return common.ErrInvalidPrimaryKeyDataType
 		}
 		colIdDedup[colId] = true
 	}
@@ -143,13 +157,17 @@ func (v tableSchemaValidatorImpl) validateIndividualSchema(table *common.Table, 
 		colIdDedup = make([]bool, len(table.Columns))
 		for _, sortColumnId := range table.ArchivingSortColumns {
 			if sortColumnId >= len(table.Columns) {
-				return ErrColumnNonExist
+				return common.ErrColumnNonExist
 			}
 			if table.Columns[sortColumnId].Deleted {
-				return ErrColumnDeleted
+				return common.ErrColumnDeleted
 			}
 			if colIdDedup[sortColumnId] {
-				return ErrDuplicatedColumn
+				return common.ErrDuplicatedColumn
+			}
+			colDataType := memCom.DataTypeFromString(table.Columns[sortColumnId].Type)
+			if colDataType >= memCom.ArrayBool && colDataType <= memCom.ArrayInt64 {
+				return common.ErrInvalidSortColumnDataType
 			}
 			colIdDedup[sortColumnId] = true
 		}
@@ -171,21 +189,21 @@ func (v tableSchemaValidatorImpl) validateSchemaUpdate(newTable, oldTable *commo
 	}
 
 	if newTable.Name != oldTable.Name {
-		return ErrSchemaUpdateNotAllowed
+		return common.ErrSchemaUpdateNotAllowed
 	}
 
 	if newTable.IsFactTable != oldTable.IsFactTable {
-		return ErrSchemaUpdateNotAllowed
+		return common.ErrSchemaUpdateNotAllowed
 	}
 
 	// validate columns
 	if len(newTable.Columns) < len(oldTable.Columns) {
 		// even with column deletion, or recreation, column id are not reused
-		return ErrInsufficientColumnCount
+		return common.ErrInsufficientColumnCount
 	}
 
 	if oldTable.IsFactTable && oldTable.Config.AllowMissingEventTime && !newTable.Config.AllowMissingEventTime {
-		return ErrDisallowMissingEventTime
+		return common.ErrDisallowMissingEventTime
 	}
 
 	var i int
@@ -195,7 +213,7 @@ func (v tableSchemaValidatorImpl) validateSchemaUpdate(newTable, oldTable *commo
 		newCol := newTable.Columns[i]
 		if oldCol.Deleted {
 			if !newCol.Deleted {
-				return ErrReusingColumnIDNotAllowed
+				return common.ErrReusingColumnIDNotAllowed
 			}
 		}
 		// check that no column configs are modified, even for deleted columns
@@ -205,38 +223,31 @@ func (v tableSchemaValidatorImpl) validateSchemaUpdate(newTable, oldTable *commo
 			oldCol.CaseInsensitive != newCol.CaseInsensitive ||
 			oldCol.DisableAutoExpand != newCol.DisableAutoExpand ||
 			oldCol.HLLConfig != newCol.HLLConfig {
-			return ErrSchemaUpdateNotAllowed
-		}
-	}
-
-	for ; i < len(newTable.Columns); i++ {
-		newCol := newTable.Columns[i]
-		if newCol.Deleted {
-			return ErrNewColumnWithDeletion
+			return common.ErrSchemaUpdateNotAllowed
 		}
 	}
 	// end validate columns
 
 	// primary key columns
 	if !reflect.DeepEqual(newTable.PrimaryKeyColumns, oldTable.PrimaryKeyColumns) {
-		return ErrChangePrimaryKeyColumn
+		return common.ErrChangePrimaryKeyColumn
 	}
 
 	// sort columns
 	if len(newTable.ArchivingSortColumns) < len(oldTable.ArchivingSortColumns) {
-		return ErrIllegalChangeSortColumn
+		return common.ErrIllegalChangeSortColumn
 	}
 	for i, sortColumnId := range newTable.ArchivingSortColumns {
 		if i < len(oldTable.ArchivingSortColumns) {
 			if oldTable.ArchivingSortColumns[i] != sortColumnId {
-				return ErrIllegalChangeSortColumn
+				return common.ErrIllegalChangeSortColumn
 			}
 		}
 		if sortColumnId >= len(newTable.Columns) {
-			return ErrColumnNonExist
+			return common.ErrColumnNonExist
 		}
 		if newTable.Columns[sortColumnId].Deleted {
-			return ErrColumnDeleted
+			return common.ErrColumnDeleted
 		}
 	}
 

@@ -17,8 +17,9 @@ package api
 import (
 	"encoding/json"
 	"github.com/gorilla/mux"
+	"github.com/uber/aresdb/api/common"
 	"github.com/uber/aresdb/memstore"
-	"github.com/uber/aresdb/metastore"
+	metaCom "github.com/uber/aresdb/metastore/common"
 	"github.com/uber/aresdb/utils"
 	"net/http"
 )
@@ -26,11 +27,11 @@ import (
 // EnumHandler handlers enum rw
 type EnumHandler struct {
 	memStore  memstore.MemStore
-	metastore metastore.MetaStore
+	metastore metaCom.MetaStore
 }
 
 // NewEnumHandler returns a new enum handler
-func NewEnumHandler(memStore memstore.MemStore, metastore metastore.MetaStore) *EnumHandler {
+func NewEnumHandler(memStore memstore.MemStore, metastore metaCom.MetaStore) *EnumHandler {
 	return &EnumHandler{
 		memStore:  memStore,
 		metastore: metastore,
@@ -39,8 +40,8 @@ func NewEnumHandler(memStore memstore.MemStore, metastore metastore.MetaStore) *
 
 // Register regists paths
 func (handler *EnumHandler) Register(router *mux.Router, wrappers ...utils.HTTPHandlerWrapper) {
-	router.HandleFunc("/tables/{table}/columns/{column}/enum-cases", utils.ApplyHTTPWrappers(handler.ListEnumCases, wrappers)).Methods(http.MethodGet)
-	router.HandleFunc("/tables/{table}/columns/{column}/enum-cases", utils.ApplyHTTPWrappers(handler.AddEnumCase, wrappers)).Methods(http.MethodPost)
+	router.HandleFunc("/tables/{table}/columns/{column}/enum-cases", utils.ApplyHTTPWrappers(handler.ListEnumCases, wrappers...)).Methods(http.MethodGet)
+	router.HandleFunc("/tables/{table}/columns/{column}/enum-cases", utils.ApplyHTTPWrappers(handler.AddEnumCase, wrappers...)).Methods(http.MethodPost)
 }
 
 // ListEnumCases swagger:route GET /schema/tables/{table}/columns/{column}/enum-cases listEnumCases
@@ -49,19 +50,19 @@ func (handler *EnumHandler) Register(router *mux.Router, wrappers ...utils.HTTPH
 // Responses:
 //    default: errorResponse
 //        200: listEnumCasesResponse
-func (handler *EnumHandler) ListEnumCases(w http.ResponseWriter, r *http.Request) {
+func (handler *EnumHandler) ListEnumCases(w *utils.ResponseWriter, r *http.Request) {
 	var listEnumCasesRequest ListEnumCasesRequest
 	var listEnumCasesResponse ListEnumCasesResponse
 
-	err := ReadRequest(r, &listEnumCasesRequest)
+	err := common.ReadRequest(r, &listEnumCasesRequest)
 	if err != nil {
-		RespondWithError(w, err)
+		w.WriteError(err)
 		return
 	}
 
 	tableSchema, err := handler.memStore.GetSchema(listEnumCasesRequest.TableName)
 	if err != nil {
-		RespondWithError(w, ErrTableDoesNotExist)
+		w.WriteError(ErrTableDoesNotExist)
 		return
 	}
 
@@ -69,14 +70,14 @@ func (handler *EnumHandler) ListEnumCases(w http.ResponseWriter, r *http.Request
 	enumDict, columnExist := tableSchema.EnumDicts[listEnumCasesRequest.ColumnName]
 	if !columnExist {
 		tableSchema.RUnlock()
-		RespondWithError(w, ErrColumnDoesNotExist)
+		w.WriteError(ErrColumnDoesNotExist)
 		return
 	}
 
 	listEnumCasesResponse.JSONBuffer, err = json.Marshal(enumDict.ReverseDict)
 	tableSchema.RUnlock()
 
-	RespondWithJSONBytes(w, listEnumCasesResponse.JSONBuffer, err)
+	w.WriteJSONBytes(listEnumCasesResponse.JSONBuffer, err)
 }
 
 // AddEnumCase swagger:route POST /schema/tables/{table}/columns/{column}/enum-cases addEnumCase
@@ -86,13 +87,13 @@ func (handler *EnumHandler) ListEnumCases(w http.ResponseWriter, r *http.Request
 // Responses:
 //    default: errorResponse
 //        200: addEnumCaseResponse
-func (handler *EnumHandler) AddEnumCase(w http.ResponseWriter, r *http.Request) {
+func (handler *EnumHandler) AddEnumCase(w *utils.ResponseWriter, r *http.Request) {
 	var addEnumCaseRequest AddEnumCaseRequest
 	var addEnumCaseResponse AddEnumCaseResponse
 
-	err := ReadRequest(r, &addEnumCaseRequest)
+	err := common.ReadRequest(r, &addEnumCaseRequest)
 	if err != nil {
-		RespondWithError(w, err)
+		w.WriteError(err)
 		return
 	}
 
@@ -100,9 +101,9 @@ func (handler *EnumHandler) AddEnumCase(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		// TODO: need mapping from metaStore error to api error
 		// for metaStore error might also be user error
-		RespondWithError(w, err)
+		w.WriteError(err)
 		return
 	}
 
-	RespondWithJSONObject(w, addEnumCaseResponse.Body)
+	w.WriteObject(addEnumCaseResponse.Body)
 }

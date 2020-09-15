@@ -18,10 +18,14 @@ import (
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
+	"github.com/uber/aresdb/common"
 	diskStoreMocks "github.com/uber/aresdb/diskstore/mocks"
-	"github.com/uber/aresdb/memstore/common"
+	memCom "github.com/uber/aresdb/memstore/common"
+	memComMocks "github.com/uber/aresdb/memstore/common/mocks"
 	metaCom "github.com/uber/aresdb/metastore/common"
+
 	metaStoreMocks "github.com/uber/aresdb/metastore/mocks"
+	"github.com/uber/aresdb/redolog"
 	"github.com/uber/aresdb/utils"
 )
 
@@ -30,13 +34,14 @@ var _ = ginkgo.Describe("Purge", func() {
 	var diskStore *diskStoreMocks.DiskStore
 	var memStore *memStoreImpl
 	var tableShard *TableShard
-	var hostMemoryManager common.HostMemoryManager
+	var hostMemoryManager memCom.HostMemoryManager
 
 	testTable := "test"
 	testShardID := 0
+	bootstrapToken := new(memComMocks.BootStrapToken)
 
 	ginkgo.BeforeEach(func() {
-		tableSchema := NewTableSchema(&metaCom.Table{
+		tableSchema := memCom.NewTableSchema(&metaCom.Table{
 			Name: testTable,
 			Columns: []metaCom.Column{
 				{
@@ -59,23 +64,28 @@ var _ = ginkgo.Describe("Purge", func() {
 
 		diskStore = &diskStoreMocks.DiskStore{}
 		metaStore = &metaStoreMocks.MetaStore{}
+		redologManagerMaster, _ := redolog.NewRedoLogManagerMaster("", &common.RedoLogConfig{}, diskStore, metaStore)
+
+		options := NewOptions(bootstrapToken, redologManagerMaster)
+
 		memStore = &memStoreImpl{
 			TableShards: map[string]map[int]*TableShard{
 				testTable: {},
 			},
-			TableSchemas: map[string]*TableSchema{
+			TableSchemas: map[string]*memCom.TableSchema{
 				testTable: tableSchema,
 			},
 			diskStore:      diskStore,
 			metaStore:      metaStore,
 			HostMemManager: hostMemoryManager,
+			options:        options,
 		}
 		hostMemoryManager = NewHostMemoryManager(memStore, 1<<10)
-		tableShard = NewTableShard(tableSchema, metaStore, diskStore, hostMemoryManager, testShardID)
+		tableShard = NewTableShard(tableSchema, metaStore, diskStore, hostMemoryManager, testShardID, 1, options)
 
-		archiveBatch0, err := testFactory.ReadArchiveBatch("archiving/archiveBatch0")
+		archiveBatch0, err := GetFactory().ReadArchiveBatch("archiving/archiveBatch0")
 		Ω(err).Should(BeNil())
-		archiveBatch1, err := testFactory.ReadArchiveBatch("archiving/archiveBatch0")
+		archiveBatch1, err := GetFactory().ReadArchiveBatch("archiving/archiveBatch0")
 		Ω(err).Should(BeNil())
 
 		archivestore := NewArchiveStore(tableShard)
@@ -110,6 +120,8 @@ var _ = ginkgo.Describe("Purge", func() {
 
 		diskStore.On("DeleteBatches", testTable, testShardID, 0, 2).
 			Return(1, nil).Once()
+		bootstrapToken.On("AcquireToken", mock.Anything, mock.Anything).Return(true).Once()
+		bootstrapToken.On("ReleaseToken", mock.Anything, mock.Anything).Return().Once()
 
 		err := memStore.Purge(testTable, testShardID, 0, 2, mockReporter)
 		Ω(err).Should(BeNil())
@@ -122,4 +134,20 @@ var _ = ginkgo.Describe("Purge", func() {
 		Ω(jobDetail.Stage).Should(BeEquivalentTo("complete"))
 	})
 
+	ginkgo.It("purge should be blocked", func() {
+		jobDetail := &PurgeJobDetail{}
+
+		mockReporter := func(key string, mutator PurgeJobDetailMutator) {
+			mutator(jobDetail)
+		}
+		Ω(tableShard.ArchiveStore.CurrentVersion.Batches).Should(HaveKey(int32(1)))
+		Ω(tableShard.ArchiveStore.CurrentVersion.Batches).Should(HaveKey(int32(2)))
+
+		bootstrapToken.On("AcquireToken", mock.Anything, mock.Anything).Return(false).Once()
+		bootstrapToken.On("ReleaseToken", mock.Anything, mock.Anything).Return().Once()
+
+		err := memStore.Purge(testTable, testShardID, 0, 2, mockReporter)
+		// purge should always be no err, but here since no mock added, if not disabled, there will be mock error
+		Ω(err).Should(BeNil())
+	})
 })

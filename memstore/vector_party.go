@@ -15,20 +15,14 @@
 package memstore
 
 import (
+	"fmt"
+	"github.com/uber/aresdb/cgoutils"
 	"github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/memutils"
+	"github.com/uber/aresdb/memstore/vectors"
 	"github.com/uber/aresdb/utils"
 	"io"
+	"os"
 	"unsafe"
-)
-
-const (
-	// IgnoreCount skip setting value counts.
-	IgnoreCount common.ValueCountsUpdateMode = iota
-	// IncrementCount only increment count.
-	IncrementCount
-	// CheckExistingCount also check existing count.
-	CheckExistingCount
 )
 
 // TransferableVectorParty is vector party that can be transferred to gpu for processing
@@ -61,14 +55,27 @@ type cVectorParty struct {
 	// Set during archiving/backfill and stored on disk.
 	columnMode common.ColumnMode
 
-	values *Vector
+	values *vectors.Vector
 	// Stores the validity bitmap (0 means null) for each value in values.
-	nulls *Vector
+	nulls *vectors.Vector
 	// Stores the accumulative count from the beginning of the vector
 	// to the current position. Its length is vp.Length + 1 with first value to
 	// be 0 and last value to be vp.Length. We can get a count of current value
 	// by Counts[i+1] - Counts[i] for Values[i]
-	counts *Vector
+	counts *vectors.Vector
+}
+
+// IsList tells whether it's a list vector party or not.
+func (vp *baseVectorParty) IsList() bool {
+	return false
+}
+
+// AsList returns ListVectorParty representation of this vector party.
+// Caller should always call IsList before conversion, otherwise panic may happens
+// for incompatible vps.
+func (vp *baseVectorParty) AsList() common.ListVectorParty {
+	utils.GetLogger().Panic("Cannot convert this vp to list vp")
+	return nil
 }
 
 // GetLength returns the length this vector party
@@ -181,7 +188,7 @@ func (vp *cVectorParty) GetDataValue(offset int) common.DataValue {
 		return val
 	}
 	val.OtherVal = vp.values.GetValue(offset)
-	val.CmpFunc = vp.values.cmpFunc
+	val.CmpFunc = vp.values.CmpFunc
 	return val
 }
 
@@ -212,7 +219,7 @@ func (vp *cVectorParty) SetDataValue(offset int, value common.DataValue, countsU
 		}
 	}
 
-	if countsUpdateMode == IgnoreCount {
+	if countsUpdateMode == common.IgnoreCount {
 		return
 	}
 
@@ -223,11 +230,11 @@ func (vp *cVectorParty) SetDataValue(offset int, value common.DataValue, countsU
 		count = int(counts[0])
 	}
 
-	if countsUpdateMode == IncrementCount {
+	if countsUpdateMode == common.IncrementCount {
 		if isNonDefault {
 			vp.nonDefaultValueCount += count
 		}
-	} else if countsUpdateMode == CheckExistingCount {
+	} else if countsUpdateMode == common.CheckExistingCount {
 		existing := vp.GetDataValue(offset).Compare(vp.defaultValue) != 0
 		if !existing && isNonDefault {
 			vp.nonDefaultValueCount += count
@@ -251,14 +258,6 @@ func (vp *cVectorParty) JudgeMode() common.ColumnMode {
 	}
 	// uncompressed columns
 	return common.HasNullVector
-}
-
-// VectorPartyEquals covers nil VectorParty compare
-func VectorPartyEquals(v1 common.VectorParty, v2 common.VectorParty) bool {
-	if v1 == nil || v2 == nil {
-		return v1 == nil && v2 == nil
-	}
-	return v1.Equals(v2)
 }
 
 // Equals checks whether two vector parties are the same. **Only for unit test use.**
@@ -296,12 +295,12 @@ func (vp *cVectorParty) Equals(other common.VectorParty) bool {
 			// compare first count
 			// usually this is not needed since first count should always be 0
 			if i == 0 {
-				if vp.counts.cmpFunc(vp.counts.GetValue(0), v2.counts.GetValue(0)) != 0 {
+				if vp.counts.CmpFunc(vp.counts.GetValue(0), v2.counts.GetValue(0)) != 0 {
 					return false
 				}
 			}
 			// only compare next count
-			if vp.counts.cmpFunc(vp.counts.GetValue(i+1), v2.counts.GetValue(i+1)) != 0 {
+			if vp.counts.CmpFunc(vp.counts.GetValue(i+1), v2.counts.GetValue(i+1)) != 0 {
 				return false
 			}
 		}
@@ -435,7 +434,7 @@ func (vp *cVectorParty) SliceIndex(lowerBoundRow, upperBoundRow int) (startIndex
 // based on vector party mode. **This vector party should be from archive batch and already pruned.**
 func (vp *cVectorParty) Write(writer io.Writer) error {
 	dataWriter := utils.NewStreamDataWriter(writer)
-	if err := dataWriter.WriteUint32(VectorPartyHeader); err != nil {
+	if err := dataWriter.WriteUint32(common.VectorPartyHeader); err != nil {
 		return err
 	}
 
@@ -470,7 +469,7 @@ func (vp *cVectorParty) Write(writer io.Writer) error {
 	// Write value vector.
 	// Here we directly move data from c allocated memory into writer.
 	if err := dataWriter.Write(
-		memutils.MakeSliceFromCPtr(vp.values.buffer, vp.values.Bytes),
+		cgoutils.MakeSliceFromCPtr(uintptr(vp.values.Buffer()), vp.values.Bytes),
 	); err != nil {
 		return err
 	}
@@ -483,7 +482,7 @@ func (vp *cVectorParty) Write(writer io.Writer) error {
 	// Write null vector.
 	// Here we directly move data from c allocated memory into writer.
 	if err := dataWriter.Write(
-		memutils.MakeSliceFromCPtr(vp.nulls.buffer, vp.nulls.Bytes),
+		cgoutils.MakeSliceFromCPtr(uintptr(vp.nulls.Buffer()), vp.nulls.Bytes),
 	); err != nil {
 		return err
 	}
@@ -496,7 +495,7 @@ func (vp *cVectorParty) Write(writer io.Writer) error {
 	// Write count vector.
 	// Here we directly move data from c allocated memory into writer.
 	if err := dataWriter.Write(
-		memutils.MakeSliceFromCPtr(vp.counts.buffer, vp.counts.Bytes),
+		cgoutils.MakeSliceFromCPtr(uintptr(vp.counts.Buffer()), vp.counts.Bytes),
 	); err != nil {
 		return err
 	}
@@ -513,7 +512,7 @@ func (vp *cVectorParty) Read(reader io.Reader, s common.VectorPartySerializer) e
 		return err
 	}
 
-	if magicNumber != VectorPartyHeader {
+	if magicNumber != common.VectorPartyHeader {
 		return utils.StackError(nil, "Magic number does not match, vector party file may be corrupted")
 	}
 
@@ -563,7 +562,7 @@ func (vp *cVectorParty) Read(reader io.Reader, s common.VectorPartySerializer) e
 		return err
 	}
 
-	bytes := CalculateVectorPartyBytes(vp.GetDataType(), vp.GetLength(),
+	bytes := vectors.CalculateVectorPartyBytes(vp.GetDataType(), vp.GetLength(),
 		columnMode == common.HasNullVector || columnMode == common.HasCountVector, columnMode == common.HasCountVector)
 	s.ReportVectorPartyMemoryUsage(int64(bytes))
 
@@ -573,10 +572,10 @@ func (vp *cVectorParty) Read(reader io.Reader, s common.VectorPartySerializer) e
 	}
 
 	// Read value vector.
-	valueVector := NewVector(dataType, length)
+	valueVector := vectors.NewVector(dataType, length)
 	// Here we directly read from reader into the c allocated bytes.
 	if err = dataReader.Read(
-		memutils.MakeSliceFromCPtr(valueVector.buffer, valueVector.Bytes),
+		cgoutils.MakeSliceFromCPtr(uintptr(valueVector.Buffer()), valueVector.Bytes),
 	); err != nil {
 		valueVector.SafeDestruct()
 		return err
@@ -589,10 +588,10 @@ func (vp *cVectorParty) Read(reader io.Reader, s common.VectorPartySerializer) e
 	}
 
 	// Read null vector.
-	nullVector := NewVector(common.Bool, length)
+	nullVector := vectors.NewVector(common.Bool, length)
 	// Here we directly read from reader into the c allocated bytes.
 	if err = dataReader.Read(
-		memutils.MakeSliceFromCPtr(nullVector.buffer, nullVector.Bytes),
+		cgoutils.MakeSliceFromCPtr(uintptr(nullVector.Buffer()), nullVector.Bytes),
 	); err != nil {
 		valueVector.SafeDestruct()
 		nullVector.SafeDestruct()
@@ -606,10 +605,10 @@ func (vp *cVectorParty) Read(reader io.Reader, s common.VectorPartySerializer) e
 	}
 
 	// Read count vector.
-	countVector := NewVector(common.Uint32, length+1)
+	countVector := vectors.NewVector(common.Uint32, length+1)
 	// Here we directly read from reader into the c allocated bytes.
 	if err = dataReader.Read(
-		memutils.MakeSliceFromCPtr(countVector.buffer, countVector.Bytes),
+		cgoutils.MakeSliceFromCPtr(uintptr(countVector.Buffer()), countVector.Bytes),
 	); err != nil {
 		valueVector.SafeDestruct()
 		nullVector.SafeDestruct()
@@ -644,11 +643,28 @@ func (vp *cVectorParty) GetHostVectorPartySlice(startIndex, length int) common.H
 
 // Allocates implements Allocate in cVectorParty
 func (vp *cVectorParty) Allocate(hasCount bool) {
-	vp.values = NewVector(vp.dataType, vp.length)
-	vp.nulls = NewVector(common.Bool, vp.length)
+	vp.values = vectors.NewVector(vp.dataType, vp.length)
+	vp.nulls = vectors.NewVector(common.Bool, vp.length)
 	vp.columnMode = common.HasNullVector
 	if hasCount {
-		vp.counts = NewVector(common.Int32, vp.length+1)
+		vp.counts = vectors.NewVector(common.Int32, vp.length+1)
 		vp.columnMode = common.HasCountVector
+	}
+}
+
+// Dump is for testing purpose
+func (vp *cVectorParty) Dump(file *os.File) {
+	fmt.Fprintf(file, "\nVectorParty, type: %s, length: %d, value: \n", common.DataTypeName[vp.dataType], vp.GetLength())
+	for i := 0; i < vp.GetLength(); i++ {
+		val := vp.GetDataValue(i)
+		count := 1
+		if vp.counts != nil {
+			count = int(*(*uint32)(vp.counts.GetValue(i + 1)) - *(*uint32)(vp.counts.GetValue(i)))
+		}
+		if val.Valid {
+			fmt.Fprintf(file, "\t%v, %d\n", val.ConvertToHumanReadable(vp.dataType), count)
+		} else {
+			fmt.Fprintf(file, "\tnil\n")
+		}
 	}
 }

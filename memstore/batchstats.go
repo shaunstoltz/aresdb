@@ -1,7 +1,21 @@
+//  Copyright (c) 2017-2018 Uber Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package memstore
 
 import (
-	"github.com/uber/aresdb/metastore"
+	"github.com/uber/aresdb/cluster/topology"
 	"github.com/uber/aresdb/utils"
 	"time"
 )
@@ -10,16 +24,16 @@ import (
 type BatchStatsReporter struct {
 	intervalInSeconds int
 	memStore          MemStore
-	metaStore         metastore.MetaStore
+	shardOwner        topology.ShardOwner
 	stopChan          chan struct{}
 }
 
 // NewBatchStatsReporter create a new BatchStatsReporter instance
-func NewBatchStatsReporter(intervalInSeconds int, memStore MemStore, metaStore metastore.MetaStore) *BatchStatsReporter {
+func NewBatchStatsReporter(intervalInSeconds int, memStore MemStore, shardOwner topology.ShardOwner) *BatchStatsReporter {
 	return &BatchStatsReporter{
 		intervalInSeconds: intervalInSeconds,
 		memStore:          memStore,
-		metaStore:         metaStore,
+		shardOwner:        shardOwner,
 		stopChan:          make(chan struct{}),
 	}
 }
@@ -62,10 +76,7 @@ func (batchStats *BatchStatsReporter) reportBatchStat(batchIDs map[int]string) {
 	tables := batchStats.memStore.GetSchemas()
 
 	for table, schema := range tables {
-		shards, err := batchStats.metaStore.GetOwnedShards(table)
-		if err != nil {
-			continue
-		}
+		shards := batchStats.shardOwner.GetOwnedShards()
 		for _, shardID := range shards {
 			shard, err := batchStats.memStore.GetTableShard(table, shardID)
 			if err != nil || shard == nil {

@@ -18,25 +18,27 @@ import (
 	"unsafe"
 
 	"github.com/stretchr/testify/mock"
+	"github.com/uber/aresdb/common"
 	"github.com/uber/aresdb/diskstore"
 	"github.com/uber/aresdb/diskstore/mocks"
 	memCom "github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/metastore"
+	memComMocks "github.com/uber/aresdb/memstore/common/mocks"
 	metaCom "github.com/uber/aresdb/metastore/common"
+	"github.com/uber/aresdb/redolog"
 	"github.com/uber/aresdb/testing"
 	"github.com/uber/aresdb/utils"
 )
 
 func CreateMockDiskStore() *mocks.DiskStore {
 	diskStore := &mocks.DiskStore{}
-	diskStore.On("OpenLogFileForAppend", mock.Anything, mock.Anything, mock.Anything).Return(&testing.TestReadWriteCloser{}, nil)
+	diskStore.On("OpenLogFileForAppend", mock.Anything, mock.Anything, mock.Anything).Return(&testing.TestReadWriteSyncCloser{}, nil)
 	return diskStore
 }
 
 // createMemStore creates a memStoreImpl instance for testing.
 func createMemStore(tableName string, shardID int, columnTypes []memCom.DataType,
 	primaryKeyColumns []int, batchSize int, isFactTable bool, allowMissingEventTime bool,
-	metaStore metastore.MetaStore, diskStore diskstore.DiskStore) *memStoreImpl {
+	metaStore metaCom.MetaStore, diskStore diskstore.DiskStore) *memStoreImpl {
 	// Create schemas.
 	mainSchema := metaCom.Table{
 		Name:              tableName,
@@ -53,16 +55,22 @@ func createMemStore(tableName string, shardID int, columnTypes []memCom.DataType
 	for i, dataType := range columnTypes {
 		mainSchema.Columns[i].Type = memCom.DataTypeName[dataType]
 	}
-	schema := NewTableSchema(&mainSchema)
+	schema := memCom.NewTableSchema(&mainSchema)
 
 	for i := range columnTypes {
 		schema.SetDefaultValue(i)
 	}
 
-	memStore := NewMemStore(metaStore, diskStore).(*memStoreImpl)
+	redoManagerMaster, _ := redolog.NewRedoLogManagerMaster("", &common.RedoLogConfig{}, diskStore, metaStore)
+	bootstrapToken := new(memComMocks.BootStrapToken)
+	bootstrapToken.On("AcquireToken", mock.Anything, mock.Anything).Return(true)
+	bootstrapToken.On("ReleaseToken", mock.Anything, mock.Anything).Return()
+
+	options := NewOptions(bootstrapToken, redoManagerMaster)
+	memStore := NewMemStore(metaStore, diskStore, options).(*memStoreImpl)
 	// Create shards.
 	shards := map[int]*TableShard{
-		shardID: NewTableShard(schema, metaStore, diskStore, NewHostMemoryManager(memStore, 1<<32), shardID),
+		shardID: NewTableShard(schema, metaStore, diskStore, NewHostMemoryManager(memStore, 1<<32), shardID, 1, options),
 	}
 	memStore.TableShards[tableName] = shards
 	memStore.TableSchemas[tableName] = schema
@@ -100,7 +108,7 @@ func ReadShardBool(shard *TableShard, columnID int, primaryKey []byte) (bool, bo
 
 // Read the vector party and record index.
 func getVectorParty(shard *TableShard, columnID int, primaryKey []byte) (memCom.VectorParty, int) {
-	existing, record, err := shard.LiveStore.PrimaryKey.FindOrInsert(primaryKey, RecordID{}, uint32(utils.Now().Unix()/1000))
+	existing, record, err := shard.LiveStore.PrimaryKey.FindOrInsert(primaryKey, memCom.RecordID{}, uint32(utils.Now().Unix()/1000))
 	if err != nil || !existing {
 		return nil, 0
 	}

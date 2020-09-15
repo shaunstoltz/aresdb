@@ -15,12 +15,14 @@
 package memstore
 
 import (
+	"github.com/uber/aresdb/cluster/topology"
+	"github.com/uber/aresdb/datanode/bootstrap"
 	"sync"
 
 	"fmt"
 	"github.com/uber/aresdb/diskstore"
 	"github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/metastore"
+	metaCom "github.com/uber/aresdb/metastore/common"
 	"github.com/uber/aresdb/utils"
 )
 
@@ -33,23 +35,28 @@ type TableShardMemoryUsage struct {
 // MemStore defines the interface for managing multiple table shards in memory. This is for mocking
 // in unit tests
 type MemStore interface {
+	common.TableSchemaReader
+	bootstrap.Bootstrapable
+
 	// GetMemoryUsageDetails
 	GetMemoryUsageDetails() (map[string]TableShardMemoryUsage, error)
 	// GetScheduler returns the scheduler for scheduling archiving and backfill jobs.
 	GetScheduler() Scheduler
+	// GetHostMemoryManager returns the host memory manager
+	GetHostMemoryManager() common.HostMemoryManager
+	// AddTableShard add a table shard to the memstore
+	AddTableShard(table string, shardID int, totalShards int, needPeerCopy bool, needPurge bool)
 	// GetTableShard gets the data for a pinned table Shard. Caller needs to unpin after use.
 	GetTableShard(table string, shardID int) (*TableShard, error)
-	// GetSchema returns schema for a table.
-	GetSchema(table string) (*TableSchema, error)
-	// GetSchemas returns all table schemas.
-	GetSchemas() map[string]*TableSchema
+	// RemoveTableShard removes table shard from memstore
+	RemoveTableShard(table string, shardID int)
 	// FetchSchema fetches schema from metaStore and updates in-memory copy of table schema,
 	// and set up watch channels for metaStore schema changes, used for bootstrapping mem store.
 	FetchSchema() error
 	// InitShards loads/recovers data for shards initially owned by the current instance.
-	InitShards(schedulerOff bool)
+	InitShards(schedulerOff bool, shardOwner topology.ShardOwner)
 	// HandleIngestion logs an upsert batch and applies it to the in-memory store.
-	HandleIngestion(table string, shardID int, upsertBatch *UpsertBatch) error
+	HandleIngestion(table string, shardID int, upsertBatch *common.UpsertBatch) error
 	// Archive is the process moving stable records in fact tables from live batches to archive
 	// batches.
 	Archive(table string, shardID int, cutoff uint32, reporter ArchiveJobDetailReporter) error
@@ -63,9 +70,6 @@ type MemStore interface {
 
 	// Purge is the process to purge out of retention archive batches
 	Purge(table string, shardID, batchIDStart, batchIDEnd int, reporter PurgeJobDetailReporter) error
-
-	// Provide exclusive access to read/write data protected by MemStore.
-	utils.RWLocker
 }
 
 // memStoreImpl implements the MemStore interface.
@@ -87,14 +91,15 @@ type memStoreImpl struct {
 	// Table name and Shard ID as the map keys.
 	TableShards map[string]map[int]*TableShard
 	// Schema for all tables in the system. Schemas are not deleted for simplicity
-	TableSchemas map[string]*TableSchema
+	TableSchemas map[string]*common.TableSchema
 
 	HostMemManager common.HostMemoryManager
 
 	// reference to metaStore for registering watchers,
 	// fetch latest schema and store Shard versions.
-	metaStore metastore.MetaStore
+	metaStore metaCom.MetaStore
 	diskStore diskstore.DiskStore
+	options   Options
 
 	// each MemStore should only have one scheduler instance.
 	scheduler Scheduler
@@ -105,12 +110,13 @@ func getTableShardKey(tableName string, shardID int) string {
 }
 
 // NewMemStore creates a MemStore from the specified MetaStore.
-func NewMemStore(metaStore metastore.MetaStore, diskStore diskstore.DiskStore) MemStore {
+func NewMemStore(metaStore metaCom.MetaStore, diskStore diskstore.DiskStore, options Options) MemStore {
 	memStore := &memStoreImpl{
 		TableShards:  make(map[string]map[int]*TableShard),
-		TableSchemas: make(map[string]*TableSchema),
+		TableSchemas: make(map[string]*common.TableSchema),
 		metaStore:    metaStore,
 		diskStore:    diskStore,
+		options:      options,
 	}
 	// Create HostMemoryManager
 	memStore.HostMemManager = NewHostMemoryManager(memStore, utils.GetConfig().TotalMemorySize)
@@ -207,7 +213,7 @@ func (m *memStoreImpl) GetTableShard(table string, shardID int) (*TableShard, er
 }
 
 // GetSchema returns schema for a table.
-func (m *memStoreImpl) GetSchema(table string) (*TableSchema, error) {
+func (m *memStoreImpl) GetSchema(table string) (*common.TableSchema, error) {
 	m.RLock()
 	defer m.RUnlock()
 	schema, ok := m.TableSchemas[table]
@@ -218,7 +224,7 @@ func (m *memStoreImpl) GetSchema(table string) (*TableSchema, error) {
 }
 
 // GetSchemas returns all table schemas. Callers need to hold a reader lock to access this function.
-func (m *memStoreImpl) GetSchemas() map[string]*TableSchema {
+func (m *memStoreImpl) GetSchemas() map[string]*common.TableSchema {
 	return m.TableSchemas
 }
 
@@ -253,4 +259,104 @@ func (m *memStoreImpl) TryEvictBatchColumn(table string, shardID int, batchID in
 
 	utils.GetLogger().Debugf("Successfully evict batch from memstore: table %s, shardID %d, batchID %d, columnID %d", table, shardID, batchID, columnID)
 	return true, nil
+}
+
+func (m *memStoreImpl) AddTableShard(table string, shardID int, totalShards int, needPeerCopy bool, needPurge bool) {
+	m.Lock()
+	defer m.Unlock()
+
+	schema := m.TableSchemas[table]
+	if schema == nil {
+		// table might get deleted at this point
+		return
+	}
+
+	shardMap := m.TableShards[table]
+	if shardMap == nil {
+		shardMap = make(map[int]*TableShard)
+	}
+	if _, exist := shardMap[shardID]; !exist {
+		// create new shard
+		tableShard := NewTableShard(schema, m.metaStore, m.diskStore, m.HostMemManager, shardID, totalShards, m.options)
+		if needPeerCopy {
+			tableShard.needPeerCopy = 1
+		}
+
+		// purge to make sure disk space is clean for new table shard when it is added
+		if needPurge {
+			if err := tableShard.diskStore.DeleteTableShard(table, shardID); err != nil {
+				utils.GetLogger().With("table", table, "shard", shardID, "error", err.Error()).Fatalf("failed to purge table shard data")
+			}
+			if err := tableShard.metaStore.DeleteTableShard(table, shardID); err != nil {
+				utils.GetLogger().With("table", table, "shard", shardID, "error", err.Error()).Fatal("failed to purge table shard metadata")
+			}
+		}
+
+		shardMap[shardID] = tableShard
+		utils.AddTableShardReporter(table, shardID)
+	}
+	m.TableShards[table] = shardMap
+}
+
+func (m *memStoreImpl) RemoveTableShard(table string, shardID int) {
+	var shard *TableShard
+	// Detach first.
+	m.Lock()
+	shards := m.TableShards[table]
+	if shards != nil {
+		shard = shards[shardID]
+		delete(shards, shardID)
+		utils.DeleteTableShardReporter(table, shardID)
+	}
+	m.Unlock()
+	// Destruct.
+	if shard != nil {
+		shard.Destruct()
+	}
+}
+
+// preloadAllFactTables preloads recent days data for all columns of all table shards into memory.
+// The number of preloading days is defined at each column level. This call will happen at
+// shard initialization stage.
+func (m *memStoreImpl) preloadAllFactTables() {
+	tableShardSnapshot := make(map[string][]int)
+
+	// snapshot (tableName, shardID)s.
+	m.RLock()
+	for tableName, shardMap := range m.TableShards {
+		tableShardSnapshot[tableName] = make([]int, 0, len(shardMap))
+		for shardID := range shardMap {
+			tableShardSnapshot[tableName] = append(tableShardSnapshot[tableName], shardID)
+		}
+	}
+	m.RUnlock()
+
+	currentDay := int(utils.Now().Unix() / 86400)
+	for tableName, shardIDs := range tableShardSnapshot {
+		for _, shardID := range shardIDs {
+			tableShard, err := m.GetTableShard(tableName, shardID)
+			// Table shard may have already been removed from this node.
+			if err != nil {
+				continue
+			}
+			tableShard.Schema.RLock()
+			columns := tableShard.Schema.Schema.Columns
+			tableShard.Schema.RUnlock()
+			if tableShard.Schema.Schema.IsFactTable {
+				archiveStoreVersion := tableShard.ArchiveStore.GetCurrentVersion()
+				for columnID, column := range columns {
+					if !column.Deleted {
+						preloadingDays := column.Config.PreloadingDays
+						tableShard.PreloadColumn(columnID, currentDay-preloadingDays, currentDay)
+					}
+				}
+				archiveStoreVersion.Users.Done()
+			}
+			tableShard.Users.Done()
+		}
+	}
+}
+
+func (m *memStoreImpl) GetHostMemoryManager() common.HostMemoryManager {
+	return m.HostMemManager
 }

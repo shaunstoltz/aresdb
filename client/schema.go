@@ -1,3 +1,17 @@
+//  Copyright (c) 2017-2018 Uber Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package client
 
 import (
@@ -20,7 +34,7 @@ import (
 // SchemaFetcher is the interface for fetch schema and enums
 type SchemaFetcher interface {
 	// FetchAllSchemas fetches all schemas
-	FetchAllSchemas() ([]metaCom.Table, error)
+	FetchAllSchemas() ([]*metaCom.Table, error)
 	// FetchSchema fetch one schema for given table
 	FetchSchema(table string) (*metaCom.Table, error)
 	// FetchAllEnums fetches all enums for given table and column
@@ -80,27 +94,20 @@ func NewHttpSchemaFetcher(httpClient http.Client, address string, scope tally.Sc
 }
 
 // Start starts the CachedSchemaHandler, if interval > 0, will start periodical refresh
-func (cf *CachedSchemaHandler) Start(interval int) error {
-	err := cf.FetchAllSchema()
-	if err != nil {
-		return err
-	}
+func (cf *CachedSchemaHandler) Start(interval int) {
+	cf.FetchSchemas()
 
 	if interval <= 0 {
-		return nil
+		return
 	}
 
 	go func(refreshInterval int) {
 		ticks := time.Tick(time.Duration(refreshInterval) * time.Second)
 		for range ticks {
-			err = cf.FetchAllSchema()
-			if err != nil {
-				cf.logger.With(
-					"error", err.Error()).Errorf("Failed to fetch table schema")
-			}
+			cf.FetchSchemas()
 		}
 	}(interval)
-	return nil
+	return
 }
 
 // TranslateEnum translates given enum value to its enumID
@@ -142,13 +149,33 @@ func (cf *CachedSchemaHandler) FetchAllSchema() error {
 	}
 
 	for _, table := range tables {
-		cf.setTable(&table)
-		err := cf.fetchAndSetEnumCases(&table)
+		cf.setTable(table)
+		err := cf.fetchAndSetEnumCases(table)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// FetchSchemas fetch schemas in schemas of CachedSchemaHandler
+func (cf *CachedSchemaHandler) FetchSchemas() {
+	cf.RLock()
+	tables := make([]string, 0, len(cf.schemas))
+	for tableName := range cf.schemas {
+		tables = append(tables, tableName)
+	}
+	cf.RUnlock()
+
+	for _, tableName := range tables {
+		_, err := cf.FetchSchema(tableName)
+		if err != nil {
+			cf.logger.With("error", err.Error(),
+				"table", tableName).Errorf("Failed to fetch table schema")
+		}
+	}
+
+	return
 }
 
 // FetchSchema fetchs the schema of given table name
@@ -192,7 +219,8 @@ func (cf *CachedSchemaHandler) PrepareEnumCases(tableName, columnName string, en
 	}
 	cf.RUnlock()
 
-	if disableAutoExpand {
+	numNewEnumCases := len(newEnumCases)
+	if disableAutoExpand && numNewEnumCases > 0 {
 		// It's recommended to set up elk or sentry logging to catch this error.
 		cf.logger.With(
 			"TableName", tableName,
@@ -200,13 +228,13 @@ func (cf *CachedSchemaHandler) PrepareEnumCases(tableName, columnName string, en
 			"ColumnID", columnID,
 			"newEnumCasesSet", newEnumCases,
 			"caseInsensitive", caseInsensitive,
-		).Error("Finding new enum cases during ingestion but enum auto expansion is disabled")
+		).Warn("Finding new enum cases during ingestion but enum auto expansion is disabled")
 		cf.metricScope.Tagged(
 			map[string]string{
 				"TableName": tableName,
 				"ColumnID":  strconv.Itoa(columnID),
 			},
-		).Counter("new_enum_cases_ignored").Inc(int64(len(newEnumCases)))
+		).Counter("new_enum_cases_ignored").Inc(int64(numNewEnumCases))
 		return nil
 	}
 
@@ -245,7 +273,7 @@ func (cf *CachedSchemaHandler) fetchAndSetEnumCases(table *metaCom.Table) error 
 			defValuePtr = &defValue
 		}
 
-		if column.IsEnumColumn() {
+		if column.IsEnumBasedColumn() {
 			enumCases, err := cf.schemaFetcher.FetchAllEnums(table.Name, column.Name)
 			if err == nil {
 				for enumID, enumCase := range enumCases {
@@ -298,7 +326,7 @@ func (cf *CachedSchemaHandler) setTable(table *metaCom.Table) *TableSchema {
 		cf.enumDefaultValueMappings[table.Name] = make(map[int]int)
 	}
 	for columnID, column := range table.Columns {
-		if !column.Deleted && column.IsEnumColumn() {
+		if !column.Deleted && column.IsEnumBasedColumn() {
 			if _, columnExist := cf.enumMappings[table.Name][columnID]; !columnExist {
 				cf.enumMappings[table.Name][columnID] = make(enumDict)
 			}
@@ -319,6 +347,10 @@ func (hf *httpSchemaFetcher) FetchAllEnums(tableName, columnName string) ([]stri
 }
 
 func (hf *httpSchemaFetcher) ExtendEnumCases(tableName, columnName string, enumCases []string) ([]int, error) {
+	if len(enumCases) == 0 {
+		return []int{}, nil
+	}
+
 	enumCasesRequest := enumCasesWrapper{
 		EnumCases: enumCases,
 	}
@@ -348,7 +380,7 @@ func (hf *httpSchemaFetcher) FetchSchema(tableName string) (*metaCom.Table, erro
 	return &table, nil
 }
 
-func (hf *httpSchemaFetcher) FetchAllSchemas() ([]metaCom.Table, error) {
+func (hf *httpSchemaFetcher) FetchAllSchemas() ([]*metaCom.Table, error) {
 	var tables []string
 	resp, err := hf.httpClient.Get(hf.listTablesPath())
 	err = hf.readJSONResponse(resp, err, &tables)
@@ -356,7 +388,7 @@ func (hf *httpSchemaFetcher) FetchAllSchemas() ([]metaCom.Table, error) {
 		return nil, utils.StackError(err, "Failed to fetch table list")
 	}
 
-	var res []metaCom.Table
+	var res []*metaCom.Table
 	for _, tableName := range tables {
 		table, err := hf.FetchSchema(tableName)
 		if err != nil {
@@ -365,7 +397,7 @@ func (hf *httpSchemaFetcher) FetchAllSchemas() ([]metaCom.Table, error) {
 			}).Counter("err_fetch_table").Inc(1)
 			return nil, utils.StackError(err, "Failed to fetch schema error")
 		}
-		res = append(res, *table)
+		res = append(res, table)
 	}
 
 	return res, nil
@@ -386,6 +418,7 @@ func (hf *httpSchemaFetcher) readJSONResponse(response *http.Response, err error
 	}
 
 	err = json.Unmarshal(respBytes, data)
+	fmt.Printf("resp: %s, data: %+v\n", string(respBytes), data)
 	if err != nil {
 		return utils.StackError(err, "Failed to unmarshal json")
 	}

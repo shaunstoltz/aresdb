@@ -49,8 +49,8 @@ const timeFormatForBatchID = "2006-01-02"
 
 // DeleteTableShard : Completely wipe out a table shard.
 func (l LocalDiskStore) DeleteTableShard(table string, shard int) error {
-	tableRedologDir := getPathForTableShard(l.rootPath, table, shard)
-	return os.RemoveAll(tableRedologDir)
+	tableShardDir := getPathForTableShard(l.rootPath, table, shard)
+	return os.RemoveAll(tableShardDir)
 }
 
 // Redo Logs
@@ -96,16 +96,13 @@ func (l LocalDiskStore) OpenLogFileForReplay(table string, shard int,
 }
 
 // OpenLogFileForAppend : Opens/creates the specified log file for append.
-func (l LocalDiskStore) OpenLogFileForAppend(table string, shard int, creationTime int64) (io.WriteCloser, error) {
+func (l LocalDiskStore) OpenLogFileForAppend(table string, shard int, creationTime int64) (utils.WriteSyncCloser, error) {
 	tableRedologDir := GetPathForTableRedologs(l.rootPath, table, shard)
 	if err := os.MkdirAll(tableRedologDir, 0755); err != nil {
 		return nil, utils.StackError(err, "Failed to make dirs for path: %s", tableRedologDir)
 	}
 	logFilePath := GetPathForRedologFile(l.rootPath, table, shard, creationTime)
 	mode := os.O_APPEND | os.O_CREATE | os.O_WRONLY
-	if l.diskStoreConfig.WriteSync {
-		mode |= os.O_SYNC
-	}
 	f, err := os.OpenFile(logFilePath, mode, 0644)
 	if err != nil {
 		return nil, utils.StackError(err, "Failed to open redolog file: %s for append", logFilePath)
@@ -120,6 +117,8 @@ func (l LocalDiskStore) DeleteLogFile(table string, shard int, creationTime int6
 	if err != nil {
 		return utils.StackError(err, "Failed to delete redolog file: %s", redologFilePath)
 	}
+	utils.GetLogger().With("action", "deletelogfile", "table", table, "shard", shard).Infof("Delete redolog file: %s", redologFilePath)
+
 	return nil
 }
 
@@ -149,10 +148,12 @@ func (l LocalDiskStore) ListSnapshotBatches(table string, shard int,
 	for _, f := range batchDirs {
 		batch, err := strconv.ParseInt(f.Name(), 10, 32)
 		if err != nil {
-			return nil, utils.StackError(err, "Failed to parse dir name: %s as valid snapshot batch dir",
-				f.Name())
+			utils.GetLogger().With("err", err, "batch_dir_name", f.Name()).
+				Debug("Find invalid snapshot batch dir")
+			err = nil
+		} else {
+			batches = append(batches, int(batch))
 		}
-		batches = append(batches, int(batch))
 	}
 	sort.Ints(batches)
 	return batches, nil
@@ -163,7 +164,11 @@ func (l LocalDiskStore) ListSnapshotVectorPartyFiles(table string, shard int,
 	redoLogFile int64, offset uint32, batchID int) (columnIDs []int, err error) {
 	snapshotBatchDir := GetPathForTableSnapshotBatchDir(l.rootPath, table, shard,
 		redoLogFile, offset, batchID)
-	vpFiles, err := ioutil.ReadDir(snapshotBatchDir)
+	return l.readVectoryPartyFiles(snapshotBatchDir)
+}
+
+func (l LocalDiskStore) readVectoryPartyFiles(dir string) (columnIDs []int, err error) {
+	vpFiles, err := ioutil.ReadDir(dir)
 
 	if os.IsNotExist(err) {
 		err = nil
@@ -171,7 +176,7 @@ func (l LocalDiskStore) ListSnapshotVectorPartyFiles(table string, shard int,
 	}
 
 	if err != nil {
-		err = utils.StackError(err, "Failed to list vp file for snapshot batch dir: %s", snapshotBatchDir)
+		err = utils.StackError(err, "Failed to list vp file for batch dir: %s", dir)
 		return
 	}
 
@@ -182,14 +187,14 @@ func (l LocalDiskStore) ListSnapshotVectorPartyFiles(table string, shard int,
 			columnID, err = strconv.ParseInt(strings.Split(f.Name(), ".")[0], 10, 32)
 			if err != nil {
 				err = utils.StackError(err, "Failed to parse file name: %s as "+
-					"valid snapshot vector party file name",
+					"valid vector party file name",
 					f.Name())
 				return
 			}
 			columnIDs = append(columnIDs, int(columnID))
 		} else {
 			err = utils.StackError(nil, "Failed to parse file name: %s as "+
-				"valid snapshot vector party file name",
+				"valid vector party file name",
 				f.Name())
 			return
 		}
@@ -203,7 +208,9 @@ func (l LocalDiskStore) OpenSnapshotVectorPartyFileForRead(table string, shard i
 	redoLogFile int64, offset uint32, batchID int, columnID int) (io.ReadCloser, error) {
 	snapshotFilePath := GetPathForTableSnapshotColumnFilePath(l.rootPath, table, shard, redoLogFile, offset, batchID, columnID)
 	f, err := os.OpenFile(snapshotFilePath, os.O_RDONLY, 0644)
-	if err != nil {
+	if os.IsNotExist(err) {
+		return nil, os.ErrNotExist
+	} else if err != nil {
 		return nil, utils.StackError(err, "Failed to open snapshot file: %s for read", snapshotFilePath)
 	}
 	return f, nil
@@ -211,16 +218,13 @@ func (l LocalDiskStore) OpenSnapshotVectorPartyFileForRead(table string, shard i
 
 // OpenSnapshotVectorPartyFileForWrite : Creates/truncates the snapshot file for write at the specified version.
 func (l LocalDiskStore) OpenSnapshotVectorPartyFileForWrite(table string, shard int,
-	redoLogFile int64, offset uint32, batchID int, columnID int) (io.WriteCloser, error) {
+	redoLogFile int64, offset uint32, batchID int, columnID int) (utils.WriteSyncCloser, error) {
 	snapshotFilePath := GetPathForTableSnapshotColumnFilePath(l.rootPath, table, shard, redoLogFile, offset, batchID, columnID)
 	dir := filepath.Dir(snapshotFilePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, utils.StackError(err, "Failed to make dirs for path: %s", dir)
 	}
 	mode := os.O_CREATE | os.O_WRONLY
-	if l.diskStoreConfig.WriteSync {
-		mode |= os.O_SYNC
-	}
 	f, err := os.OpenFile(snapshotFilePath, mode, 0644)
 	os.Truncate(snapshotFilePath, 0)
 	if err != nil {
@@ -280,6 +284,14 @@ func (l LocalDiskStore) DeleteSnapshot(table string, shard int, latestRedoLogFil
 
 // Archived vector party files.
 
+// ListArchiveBatchVectorPartyFiles return all vp for one batch version/seq
+func (l LocalDiskStore) ListArchiveBatchVectorPartyFiles(table string, shard, batchID int,
+	batchVersion uint32, seqNum uint32) ([]int, error) {
+	batchIDTimeStr := daysSinceEpochToTimeStr(batchID)
+	tableArchiveBatchDir := GetPathForTableArchiveBatchDir(l.rootPath, table, shard, batchIDTimeStr, batchVersion, seqNum)
+	return l.readVectoryPartyFiles(tableArchiveBatchDir)
+}
+
 // OpenVectorPartyFileForRead : Opens the vector party file at the specified batchVersion for read.
 func (l LocalDiskStore) OpenVectorPartyFileForRead(table string, columnID int, shard, batchID int, batchVersion uint32,
 	seqNum uint32) (io.ReadCloser, error) {
@@ -288,7 +300,7 @@ func (l LocalDiskStore) OpenVectorPartyFileForRead(table string, columnID int, s
 		seqNum, columnID)
 	f, err := os.OpenFile(vectorPartyFilePath, os.O_RDONLY, 0644)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, os.ErrNotExist
 	} else if err != nil {
 		return nil, utils.StackError(err, "Failed to open vector party file: %s for read", vectorPartyFilePath)
 	}
@@ -297,7 +309,7 @@ func (l LocalDiskStore) OpenVectorPartyFileForRead(table string, columnID int, s
 
 // OpenVectorPartyFileForWrite : Creates/truncates the vector party file at the specified batchVersion for write.
 func (l LocalDiskStore) OpenVectorPartyFileForWrite(table string, columnID int, shard, batchID int, batchVersion uint32,
-	seqNum uint32) (io.WriteCloser, error) {
+	seqNum uint32) (utils.WriteSyncCloser, error) {
 	batchIDTimeStr := daysSinceEpochToTimeStr(batchID)
 	batchDir := GetPathForTableArchiveBatchDir(l.rootPath, table, shard, batchIDTimeStr, batchVersion, seqNum)
 	if err := os.MkdirAll(batchDir, 0755); err != nil {
@@ -307,10 +319,6 @@ func (l LocalDiskStore) OpenVectorPartyFileForWrite(table string, columnID int, 
 		seqNum, columnID)
 
 	mode := os.O_CREATE | os.O_WRONLY
-	if l.diskStoreConfig.WriteSync {
-		mode |= os.O_SYNC
-	}
-
 	f, err := os.OpenFile(vectorPartyFilePath, mode, 0644)
 	if err != nil {
 		return nil, utils.StackError(err, "Failed to open vector party file: %s for write", vectorPartyFilePath)
@@ -343,10 +351,6 @@ func (l LocalDiskStore) DeleteBatches(table string, shard, batchIDStart, batchID
 	batchIDEndTime := daysSinceEpochToTime(batchIDEnd)
 	tableArchiveBatchRootDir := GetPathForTableArchiveBatchRootDir(l.rootPath, table, shard)
 	tableArchiveBatchDirs, err := ioutil.ReadDir(tableArchiveBatchRootDir)
-
-	if os.IsNotExist(err) {
-		return 0, nil
-	}
 
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -382,10 +386,6 @@ func (l LocalDiskStore) DeleteBatches(table string, shard, batchIDStart, batchID
 func (l LocalDiskStore) DeleteColumn(table string, columnID int, shard int) error {
 	tableArchiveBatchRootDir := GetPathForTableArchiveBatchRootDir(l.rootPath, table, shard)
 	tableArchiveBatchDirs, err := ioutil.ReadDir(tableArchiveBatchRootDir)
-
-	if os.IsNotExist(err) {
-		return nil
-	}
 
 	if err != nil {
 		if os.IsNotExist(err) {

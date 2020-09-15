@@ -15,7 +15,9 @@
 package api
 
 import (
-	"github.com/uber/aresdb/query"
+	apiCom "github.com/uber/aresdb/api/common"
+	queryCom "github.com/uber/aresdb/query/common"
+	"github.com/uber/aresdb/query/sql"
 	"github.com/uber/aresdb/utils"
 	"net/http"
 )
@@ -34,26 +36,22 @@ import (
 //    default: errorResponse
 //        200: aqlResponse
 //        400: aqlResponse
-func (handler *QueryHandler) HandleSQL(w http.ResponseWriter, r *http.Request) {
-	sqlRequest := SQLRequest{Device: -1}
+func (handler *QueryHandler) HandleSQL(w *utils.ResponseWriter, r *http.Request) {
+	sqlRequest := apiCom.SQLRequest{Device: -1}
 
-	if err := ReadRequest(r, &sqlRequest); err != nil {
-		RespondWithBadRequest(w, err)
-		utils.GetLogger().With(
-			"error", err,
-			"statusCode", http.StatusBadRequest,
-		).Error("failed to parse query")
+	if err := apiCom.ReadRequest(r, &sqlRequest); err != nil {
+		w.WriteErrorWithCode(http.StatusBadRequest, err)
 		return
 	}
 
-	var aqlQueries []query.AQLQuery
+	var aqlQueries []queryCom.AQLQuery
 	if sqlRequest.Body.Queries != nil {
-		aqlQueries = make([]query.AQLQuery, len(sqlRequest.Body.Queries))
+		aqlQueries = make([]queryCom.AQLQuery, len(sqlRequest.Body.Queries))
 		startTs := utils.Now()
 		for i, sqlQuery := range sqlRequest.Body.Queries {
-			parsedAQLQuery, err := query.Parse(sqlQuery, utils.GetLogger())
+			parsedAQLQuery, err := sql.Parse(sqlQuery, utils.GetLogger())
 			if err != nil {
-				RespondWithBadRequest(w, err)
+				w.WriteErrorWithCode(http.StatusBadRequest, err)
 				return
 			}
 			aqlQueries[i] = *parsedAQLQuery
@@ -61,20 +59,30 @@ func (handler *QueryHandler) HandleSQL(w http.ResponseWriter, r *http.Request) {
 		sqlParseTimer := utils.GetRootReporter().GetTimer(utils.QuerySQLParsingLatency)
 		duration := utils.Now().Sub(startTs)
 		sqlParseTimer.Record(duration)
-
 	}
 
-	aqlRequest := AQLRequest{
+	aqlRequest := apiCom.AQLRequest{
 		Device:                sqlRequest.Device,
-		Verbose:               sqlRequest.Verbose,
+		Verbose:               sqlRequest.Verbose + sqlRequest.Debug,
 		Debug:                 sqlRequest.Debug,
 		Profiling:             sqlRequest.Profiling,
 		DeviceChoosingTimeout: sqlRequest.DeviceChoosingTimeout,
 		Accept:                sqlRequest.Accept,
 		Origin:                sqlRequest.Origin,
-		Body: query.AQLRequest{
+		Body: queryCom.AQLRequest{
 			Queries: aqlQueries,
 		},
 	}
-	handler.handleAQLInternal(aqlRequest, w, r)
+
+	done := make(chan struct{})
+	available := handler.workerPool.GoIfAvailable(func() {
+		defer close(done)
+		handler.handleAQLInternal(aqlRequest, w, r)
+	})
+
+	if !available {
+		w.WriteError(apiCom.ErrQueryServiceNotAvailable)
+		return
+	}
+	<-done
 }

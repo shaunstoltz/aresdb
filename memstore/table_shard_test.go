@@ -28,7 +28,7 @@ var _ = ginkgo.Describe("table Shard", func() {
 	ginkgo.It("deletes data for a column upon request", func() {
 		// Prepare schema and Shard
 		diskStore := &mocks.DiskStore{}
-		schema := NewTableSchema(&metaCom.Table{
+		schema := common.NewTableSchema(&metaCom.Table{
 			Name:                 "trips",
 			IsFactTable:          true,
 			PrimaryKeyColumns:    []int{1},
@@ -58,8 +58,8 @@ var _ = ginkgo.Describe("table Shard", func() {
 			schema.SetDefaultValue(columnID)
 		}
 
-		shard := NewTableShard(schema, nil, diskStore,
-			NewHostMemoryManager(getFactory().NewMockMemStore(), 1<<32), 0)
+		m := GetFactory().NewMockMemStore()
+		shard := NewTableShard(schema, nil, diskStore, NewHostMemoryManager(m, 1<<32), 0, 1, m.options)
 
 		// Prepare live store
 		shard.LiveStore.AdvanceNextWriteRecord()
@@ -74,12 +74,12 @@ var _ = ginkgo.Describe("table Shard", func() {
 
 		// Prepare archive store
 		aBatch := &ArchiveBatch{
-			Batch:   Batch{RWMutex: &sync.RWMutex{}},
+			Batch:   common.Batch{RWMutex: &sync.RWMutex{}},
 			Version: 1600,
 			BatchID: 100,
 			Shard:   shard,
 		}
-		aBatch.Columns = []common.VectorParty{nil, nil, &archiveVectorParty{allUsersDone: sync.NewCond(aBatch)}}
+		aBatch.Columns = []common.VectorParty{nil, nil, &archiveVectorParty{Pinnable: common.Pinnable{AllUsersDone: sync.NewCond(aBatch)}}}
 		shard.ArchiveStore.CurrentVersion.Batches[100] = aBatch
 
 		// Test!

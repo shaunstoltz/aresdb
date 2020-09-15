@@ -149,6 +149,38 @@ var _ = ginkgo.Describe("upsert batch builder", func() {
 		Ω(buffer).Should(Equal([]byte{1, 0, 237, 254, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 89, 0, 0, 0, 89, 0, 0, 0, 97, 0, 0, 0, 105, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 123, 0, 200, 1, 21, 3, 0, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0}))
 	})
 
+	ginkgo.It("works for array types", func() {
+		builder := NewUpsertBatchBuilder()
+
+		// All null bools.
+		err := builder.AddColumn(1, Uint8)
+		Ω(err).Should(BeNil())
+		err = builder.AddColumn(2, ArrayInt16)
+		Ω(err).Should(BeNil())
+		err = builder.AddColumn(3, Int16)
+		Ω(err).Should(BeNil())
+
+		builder.AddRow()
+		err = builder.SetValue(0, 0, 1)
+		Ω(err).Should(BeNil())
+		err = builder.SetValue(0, 1, "[11,12,13]")
+		Ω(err).Should(BeNil())
+		err = builder.SetValue(0, 2, "101")
+		Ω(err).Should(BeNil())
+
+		builder.AddRow()
+		err = builder.SetValue(1, 0, 2)
+		Ω(err).Should(BeNil())
+		err = builder.SetValue(1, 1, "[21,22,23]")
+		Ω(err).Should(BeNil())
+		err = builder.SetValue(1, 2, "102")
+		Ω(err).Should(BeNil())
+
+		buffer, err := builder.ToByteArray()
+		Ω(err).Should(BeNil())
+		Ω(buffer).Should(Equal([]byte{1, 0, 237, 254, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 89, 0, 0, 0, 98, 0, 0, 0, 144, 0, 0, 0, 148, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 2, 0, 16, 0, 3, 1, 16, 0, 3, 0, 1, 0, 2, 0, 3, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0, 3, 0, 0, 0, 11, 0, 12, 0, 13, 0, 7, 0, 0, 0, 0, 0, 3, 0, 0, 0, 21, 0, 22, 0, 23, 0, 7, 0, 0, 0, 0, 0, 101, 0, 102, 0, 0, 0, 0, 0}))
+	})
+
 	ginkgo.It("UpdateOverWrite add column ex fail", func() {
 		builder := NewUpsertBatchBuilder()
 		err := builder.AddColumn(1, Uint8)
@@ -273,22 +305,21 @@ var _ = ginkgo.Describe("upsert batch builder", func() {
 		Ω(*(*float32)(unsafe.Pointer(&oldValue))).Should(Equal(float32(1.0)))
 	})
 
-	ginkgo.It("set enum as string directly", func() {
-		builder := NewUpsertBatchBuilder()
-		err := builder.AddColumn(0, SmallEnum)
-		Ω(err).Should(BeNil())
-		err = builder.AddColumn(1, BigEnum)
+	ginkgo.It("upsert batch column builder setValue", func() {
+		builder := columnBuilder{
+			columnID:     0,
+			dataType:     Uint32,
+			values:       make([]interface{}, 1),
+			isTimeColumn: true,
+		}
+
+		err := builder.SetValue(0, "1570489452010")
 		Ω(err).Should(BeNil())
 
-		builder.AddRow()
-		builder.SetValue(0, 0, "s1")
-		builder.SetValue(0, 1, "b1")
-		builder.AddRow()
-		builder.SetValue(1, 0, "s2")
-		builder.SetValue(1, 1, "b2")
-
-		byts, err := builder.ToByteArray()
+		err = builder.SetValue(0, "1570489452")
 		Ω(err).Should(BeNil())
-		Ω(byts).Should(Equal([]byte{1, 0, 237, 254, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 70, 0, 0, 0, 82, 0, 0, 0, 100, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 8, 0, 16, 0, 9, 0, 0, 0, 1, 0, 1, 1, 1, 115, 49, 0, 10, 115, 50, 0, 0, 0, 0, 1, 1, 98, 49, 0, 10, 98, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0}))
+
+		err = builder.SetValue(0, "abcd")
+		Ω(err).ShouldNot(BeNil())
 	})
 })

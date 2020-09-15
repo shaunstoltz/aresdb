@@ -15,36 +15,34 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"net/http/httptest"
-
-	"time"
-
 	"github.com/gorilla/mux"
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/mock"
+	"github.com/uber/aresdb/cluster/topology"
+	"github.com/uber/aresdb/common"
 	"github.com/uber/aresdb/diskstore"
 	"github.com/uber/aresdb/memstore"
 	memCom "github.com/uber/aresdb/memstore/common"
+	memComMocks "github.com/uber/aresdb/memstore/common/mocks"
 	memMocks "github.com/uber/aresdb/memstore/mocks"
 	"github.com/uber/aresdb/metastore"
 	metaCom "github.com/uber/aresdb/metastore/common"
+	"github.com/uber/aresdb/query"
+	"github.com/uber/aresdb/redolog"
 	"github.com/uber/aresdb/utils"
 	utilsMocks "github.com/uber/aresdb/utils/mocks"
-
+	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
-
 	"strconv"
-
-	"bytes"
-	"github.com/pkg/errors"
-	"github.com/stretchr/testify/mock"
-	"github.com/uber/aresdb/common"
-	"github.com/uber/aresdb/query"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -61,10 +59,7 @@ func convertToAPIError(err error) error {
 
 var _ = ginkgo.Describe("DebugHandler", func() {
 
-	testFactory := memstore.TestFactoryT{
-		RootPath:   "../testing/data",
-		FileSystem: utils.OSFileSystem{},
-	}
+	testFactory := memstore.GetFactory()
 
 	testTableName := "test"
 	testTableShardID := 1
@@ -103,7 +98,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 			BackfillThresholdInBytes: 1 << 21,
 		},
 	}
-	var testSchema *memstore.TableSchema
+	var testSchema *memCom.TableSchema
 
 	redoLogTableName := "abc"
 	redoLogShardID := 0
@@ -117,7 +112,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 	ginkgo.BeforeEach(func() {
 		testBatch, _ := testFactory.ReadArchiveBatch("archiveBatch")
 		testArchiveBatch := memstore.ArchiveBatch{
-			Batch: memstore.Batch{
+			Batch: memCom.Batch{
 				RWMutex: &sync.RWMutex{},
 				Columns: testBatch.Columns,
 			},
@@ -132,12 +127,12 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		Ω(err).Should(BeNil())
 
 		// test table
-		testSchema = memstore.NewTableSchema(&testTable)
+		testSchema = memCom.NewTableSchema(&testTable)
 		for col := range testSchema.Schema.Columns {
 			testSchema.SetDefaultValue(col)
 		}
 
-		testSchema.EnumDicts["c6"] = memstore.EnumDict{}
+		testSchema.EnumDicts["c6"] = memCom.EnumDict{}
 		enumDict, ok := testSchema.EnumDicts["c6"]
 		Ω(ok).Should(BeTrue())
 		enumDict.ReverseDict = append(enumDict.ReverseDict, "enum case1")
@@ -154,15 +149,10 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 			batchID: &testArchiveBatch,
 		}
 
-		testShard.LiveStore = memstore.NewLiveStore(
-			10,
-			testShard,
-		)
-
 		testArchiveBatch.Shard = testShard
 
 		key := []byte{1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1}
-		recordID := memstore.RecordID{
+		recordID := memCom.RecordID{
 			BatchID: 1,
 			Index:   1,
 		}
@@ -175,19 +165,22 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		liveBatch := testShard.LiveStore.GetBatchForWrite(memstore.BaseBatchID)
 		liveBatch.Unlock()
 		vp := liveBatch.GetOrCreateVectorParty(5, false)
-		vp.SetDataValue(0, memCom.DataValue{Valid: true}, memstore.IgnoreCount)
+		vp.SetDataValue(0, memCom.DataValue{Valid: true}, memCom.IgnoreCount)
 
 		var val uint8 = 0
 		vp = liveBatch.GetOrCreateVectorParty(6, false)
-		vp.SetDataValue(0, memCom.DataValue{Valid: true, OtherVal: unsafe.Pointer(&val)}, memstore.IgnoreCount)
+		vp.SetDataValue(0, memCom.DataValue{Valid: true, OtherVal: unsafe.Pointer(&val)}, memCom.IgnoreCount)
 
 		// redolog table.
 		redoLogTable, err := testMetaStore.GetTable(redoLogTableName)
 		Ω(err).Should(BeNil())
-		redoLogTableSchema := &memstore.TableSchema{
+		redoLogTableSchema := &memCom.TableSchema{
 			Schema: *redoLogTable,
 		}
-		redoLogShard := memstore.NewTableShard(redoLogTableSchema, mockMetaStore, testDiskStore, CreateMockHostMemoryManger(), redoLogShardID)
+		redoManagerFactory, _ := redolog.NewRedoLogManagerMaster("", &common.RedoLogConfig{}, mockDiskStore, mockMetaStore)
+
+		options := memstore.NewOptions(new(memComMocks.BootStrapToken), redoManagerFactory)
+		redoLogShard := memstore.NewTableShard(redoLogTableSchema, mockMetaStore, testDiskStore, CreateMockHostMemoryManger(), redoLogShardID, 1, options)
 
 		mockShardNotExistErr := convertToAPIError(errors.New("Failed to get shard"))
 		memStore.On("GetTableShard", redoLogTableName, redoLogShardID).Return(redoLogShard, nil).
@@ -217,20 +210,25 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 			"DeleteLogFile", mock.Anything, mock.Anything,
 			mock.Anything).Return(nil)
 
-		writer := new(utilsMocks.WriteCloser)
+		writer := new(utilsMocks.WriteSyncCloser)
 		writer.On("Write", mock.Anything).Return(0, nil)
 		writer.On("Close").Return(nil)
+		writer.On("Sync").Return(nil)
 		mockDiskStore.On(
 			"OpenVectorPartyFileForWrite", mock.Anything,
 			mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(writer, nil)
 
-		queryHandler := NewQueryHandler(memStore, common.QueryConfig{
-			DeviceMemoryUtilization: 0.9,
-			DeviceChoosingTimeout:   5,
-		})
+		queryHandler := NewQueryHandler(
+			memStore,
+			topology.NewStaticShardOwner([]int{0}),
+			common.QueryConfig{
+				DeviceMemoryUtilization: 0.9,
+				DeviceChoosingTimeout:   5,
+			},
+			10)
 
 		healthCheckHandler := NewHealthCheckHandler()
-		debugHandler = NewDebugHandler(memStore, mockMetaStore, queryHandler, healthCheckHandler)
+		debugHandler = NewDebugHandler("", memStore, mockMetaStore, queryHandler, healthCheckHandler, topology.NewStaticShardOwner([]int{0}), nil)
 		testRouter := mux.NewRouter()
 		debugHandler.Register(testRouter.PathPrefix("/debug").Subrouter())
 		testServer = httptest.NewUnstartedServer(testRouter)
@@ -343,9 +341,9 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		Ω(err).Should(BeNil())
 		Ω(resp.StatusCode).Should(Equal(http.StatusOK))
 		bs, _ := ioutil.ReadAll(resp.Body)
-		var r memstore.RecordID
+		var r memCom.RecordID
 		json.Unmarshal(bs, &r)
-		Ω(r).Should(Equal(memstore.RecordID{
+		Ω(r).Should(Equal(memCom.RecordID{
 			BatchID: 1,
 			Index:   1,
 		}))
@@ -357,7 +355,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		request.Body.Cutoff = 200
 		job := new(memMocks.Job)
 		scheduler.On("NewArchivingJob", mock.Anything, mock.Anything, mock.Anything).Return(job)
-		scheduler.On("SubmitJob", job).Return(nil)
+		scheduler.On("SubmitJob", job).Return(nil, nil)
 		job.On("Run", mock.Anything).Return(nil)
 		correctURL := fmt.Sprintf("http://%s/debug/%s/%d/archive", hostPort, testTableName, testTableShardID)
 		contentType := "application/json"
@@ -426,8 +424,8 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		Ω(resp.StatusCode).Should(Equal(http.StatusBadRequest))
 		Ω(string(bs)).Should(ContainSubstring("Failed to get shard"))
 
-		// Redo log file does not exist.
-		resp, err = http.Get(
+		//Redo log file does not exist.
+		resp, err = http.DefaultClient.Get(
 			fmt.Sprintf("http://%s/debug/%s/%d/redologs/%d/upsertbatches", hostPort, redoLogTableName,
 				redoLogShardID, 1))
 		Ω(err).Should(BeNil())
@@ -591,6 +589,14 @@ var _ = ginkgo.Describe("DebugHandler", func() {
     "primaryKeyBytes": 0,
     "primaryKeyColumnTypes": []
   },
+  "BootstrapState": 0,
+  "bootstrapDetails": {
+	"source": "",
+	"startedAt": 0,
+    "stage": "waiting",
+    "numColumns": 0,
+    "batches": {}
+  },
   "liveStore": {
     "backfillManager": {
       "numRecords": 0,
@@ -628,13 +634,13 @@ var _ = ginkgo.Describe("DebugHandler", func() {
     },
     "redoLogManager": {
       "rotationInterval": 0,
-      "maxRedoLogSize": 0,
-      "currentRedoLogSize": 0,
-      "totalRedologSize": 0,
-      "maxEventTimePerFile": {},
-      "batchCountPerFile": {},
-      "sizePerFile": {},
-      "currentFileCreationTime": 0
+       "maxRedoLogSize": 0,
+       "currentRedoLogSize": 0,
+       "totalRedologSize": 0,
+       "maxEventTimePerFile": {},
+       "batchCountPerFile": {},
+       "sizePerFile": {},
+       "currentFileCreationTime": 0
     },
     "snapshotManager": null
   },
@@ -845,7 +851,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		builder.SetValue(0, 0, uint8(135))
 		buffer, err := builder.ToByteArray()
 		Ω(err).Should(BeNil())
-		upsertBatch, err := memstore.NewUpsertBatch(buffer)
+		upsertBatch, err := memCom.NewUpsertBatch(buffer)
 		Ω(upsertBatch).ShouldNot(BeNil())
 		Ω(err).Should(BeNil())
 
@@ -922,7 +928,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		Ω(err).Should(BeNil())
 		job := new(memMocks.Job)
 		scheduler.On("NewBackfillJob", mock.Anything, mock.Anything, mock.Anything).Return(job)
-		scheduler.On("SubmitJob", job).Return(nil)
+		scheduler.On("SubmitJob", job).Return(nil, nil)
 		job.On("Run", mock.Anything).Return(nil)
 		correctURL := fmt.Sprintf("http://%s/debug/%s/%d/backfill", hostPort, testTableName, testTableShardID)
 		contentType := "application/json"
@@ -949,7 +955,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		bs, err := json.Marshal(request)
 		job := new(memMocks.Job)
 		scheduler.On("NewSnapshotJob", mock.Anything, mock.Anything, mock.Anything).Return(job)
-		scheduler.On("SubmitJob", job).Return(nil)
+		scheduler.On("SubmitJob", job).Return(nil, nil)
 		job.On("Run", mock.Anything).Return(nil)
 		correctURL := fmt.Sprintf("http://%s/debug/%s/%d/snapshot", hostPort, testTableName, testTableShardID)
 		contentType := "application/json"
@@ -976,7 +982,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		bs, err := json.Marshal(request)
 		job := new(memMocks.Job)
 		scheduler.On("NewPurgeJob", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(job)
-		scheduler.On("SubmitJob", job).Return(nil)
+		scheduler.On("SubmitJob", job).Return(nil, nil)
 		job.On("Run", mock.Anything).Return(nil)
 		correctURL := fmt.Sprintf("http://%s/debug/%s/%d/purge", hostPort, testTableName, testTableShardID)
 		contentType := "application/json"
@@ -1014,5 +1020,44 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		bs, err = ioutil.ReadAll(resp.Body)
 		Ω(err).Should(BeNil())
 		Ω(resp.StatusCode).Should(Equal(http.StatusOK))
+	})
+
+	ginkgo.It("translateEnums should work", func() {
+		vector := memCom.SlicedVector{
+			Values: []interface{}{
+				"[1,null,3]",
+				"[2,4]",
+				nil,
+			},
+			Counts: []int{
+				1,
+				2,
+				3,
+			},
+		}
+		enumCases := []string{
+			"zero",
+			"one",
+			"two",
+			"three",
+			"four",
+			"five",
+		}
+		err := translateEnums(true, &vector, enumCases)
+		Ω(err).Should(BeNil())
+		Ω(vector.Values[0]).Should(Equal("[\"one\",null,\"three\"]"))
+		Ω(vector.Values[1]).Should(Equal("[\"two\",\"four\"]"))
+		Ω(vector.Values[2]).Should(BeNil())
+	})
+
+	ginkgo.It("BootstrapRetry", func() {
+		debugHandler.SetBootstrapRetryChan(make(chan bool, 1))
+		retryChan := debugHandler.GetBootstrapRetryChan()
+		Ω(retryChan).ShouldNot(BeNil())
+		hostPort := testServer.Listener.Addr().String()
+
+		resp, err := http.Post(fmt.Sprintf("http://%s/debug/bootstrap/retry", hostPort), "", nil)
+		Ω(err).Should(BeNil())
+		Ω(resp.StatusCode).Should(Equal(200))
 	})
 })

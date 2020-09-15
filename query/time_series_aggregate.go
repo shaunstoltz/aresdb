@@ -18,13 +18,13 @@ package query
 // #include "time_series_aggregate.h"
 import "C"
 import (
+	"github.com/uber/aresdb/utils"
 	"strconv"
 	"unsafe"
 
 	"github.com/uber/aresdb/cgoutils"
 	"github.com/uber/aresdb/memstore"
 	memCom "github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/memutils"
 	"github.com/uber/aresdb/query/common"
 	"github.com/uber/aresdb/query/expr"
 )
@@ -62,28 +62,31 @@ var UnaryExprTypeToCFunctorType = map[expr.Token]C.enum_UnaryFunctorType{
 	expr.GET_MONTH_OF_YEAR:   C.GetMonthOfYear,
 	expr.GET_QUARTER_OF_YEAR: C.GetQuarterOfYear,
 	expr.GET_HLL_VALUE:       C.GetHLLValue,
+	expr.ARRAY_LENGTH:        C.ArrayLength,
 }
 
 // BinaryExprTypeToCFunctorType maps from binary operator to C BinaryFunctorType
 var BinaryExprTypeToCFunctorType = map[expr.Token]C.enum_BinaryFunctorType{
-	expr.AND:         C.And,
-	expr.OR:          C.Or,
-	expr.EQ:          C.Equal,
-	expr.NEQ:         C.NotEqual,
-	expr.LT:          C.LessThan,
-	expr.LTE:         C.LessThanOrEqual,
-	expr.GT:          C.GreaterThan,
-	expr.GTE:         C.GreaterThanOrEqual,
-	expr.ADD:         C.Plus,
-	expr.SUB:         C.Minus,
-	expr.MUL:         C.Multiply,
-	expr.DIV:         C.Divide,
-	expr.MOD:         C.Mod,
-	expr.BITWISE_AND: C.BitwiseAnd,
-	expr.BITWISE_OR:  C.BitwiseOr,
-	expr.BITWISE_XOR: C.BitwiseXor,
-	expr.FLOOR:       C.Floor,
-	expr.CONVERT_TZ:  C.Plus,
+	expr.AND:              C.And,
+	expr.OR:               C.Or,
+	expr.EQ:               C.Equal,
+	expr.NEQ:              C.NotEqual,
+	expr.LT:               C.LessThan,
+	expr.LTE:              C.LessThanOrEqual,
+	expr.GT:               C.GreaterThan,
+	expr.GTE:              C.GreaterThanOrEqual,
+	expr.ADD:              C.Plus,
+	expr.SUB:              C.Minus,
+	expr.MUL:              C.Multiply,
+	expr.DIV:              C.Divide,
+	expr.MOD:              C.Mod,
+	expr.BITWISE_AND:      C.BitwiseAnd,
+	expr.BITWISE_OR:       C.BitwiseOr,
+	expr.BITWISE_XOR:      C.BitwiseXor,
+	expr.FLOOR:            C.Floor,
+	expr.CONVERT_TZ:       C.Plus,
+	expr.ARRAY_CONTAINS:   C.ArrayContains,
+	expr.ARRAY_ELEMENT_AT: C.ArrayElementAt,
 	// TODO: expr.BITWISE_LEFT_SHIFT ?
 	// TODO: expr.BITWISE_RIGHT_SHIFT ?
 }
@@ -168,26 +171,26 @@ func makeVectorPartySlice(column deviceVectorPartySlice) C.VectorPartySlice {
 	var valuesOffset uint32
 
 	if !column.counts.isNull() {
-		basePtr = memutils.MemAccess(column.counts.getPointer(), column.countStartIndex*4)
+		basePtr = utils.MemAccess(column.counts.getPointer(), column.countStartIndex*4)
 	}
 
 	if !column.nulls.isNull() {
 		startingIndex = column.nullStartIndex % 8
-		nulls := memutils.MemAccess(column.nulls.getPointer(), column.nullStartIndex/8)
+		nulls := utils.MemAccess(column.nulls.getPointer(), column.nullStartIndex/8)
 		if basePtr == nil {
 			basePtr = nulls
 		} else {
-			nullsOffset = uint32(memutils.MemDist(nulls, basePtr))
+			nullsOffset = uint32(utils.MemDist(nulls, basePtr))
 		}
 	}
 
 	if !column.values.isNull() {
-		values := memutils.MemAccess(column.values.getPointer(),
+		values := utils.MemAccess(column.values.getPointer(),
 			column.valueStartIndex*memCom.DataTypeBits(column.valueType)/8)
 		if basePtr == nil {
 			basePtr = values
 		} else {
-			valuesOffset = uint32(memutils.MemDist(values, basePtr))
+			valuesOffset = uint32(utils.MemDist(values, basePtr))
 		}
 	}
 
@@ -202,10 +205,29 @@ func makeVectorPartySlice(column deviceVectorPartySlice) C.VectorPartySlice {
 	return vpSlice
 }
 
+func makeArrayVectorPartySlice(column deviceVectorPartySlice) C.ArrayVectorPartySlice {
+	var vpSlice C.ArrayVectorPartySlice
+	vpSlice.OffsetLengthVector = (*C.uint8_t)(column.basePtr.getPointer())
+	vpSlice.ValueOffsetAdj = (C.uint32_t)(column.valueOffsetAdjust)
+	vpSlice.Length = (C.uint32_t)(column.length)
+	vpSlice.DataType = DataTypeToCDataType[memCom.GetElementDataType(column.valueType)]
+	return vpSlice
+}
+
 func makeVectorPartySliceInput(column deviceVectorPartySlice) C.InputVector {
+	if memCom.IsArrayType(column.valueType) {
+		return makeArrayVectorPartySliceInput(column)
+	}
 	var vector C.InputVector
 	*(*C.VectorPartySlice)(unsafe.Pointer(&vector.Vector)) = makeVectorPartySlice(column)
 	vector.Type = C.VectorPartyInput
+	return vector
+}
+
+func makeArrayVectorPartySliceInput(column deviceVectorPartySlice) C.InputVector {
+	var vector C.InputVector
+	*(*C.ArrayVectorPartySlice)(unsafe.Pointer(&vector.Vector)) = makeArrayVectorPartySlice(column)
+	vector.Type = C.ArrayVectorPartyInput
 	return vector
 }
 
@@ -222,6 +244,10 @@ func makeConstantInput(val interface{}, isValid bool) C.InputVector {
 		geopoint := val.(*expr.GeopointLiteral).Val
 		*(*C.GeoPointT)(unsafe.Pointer(&constVector.Value)) = *(*C.GeoPointT)(unsafe.Pointer(&geopoint[0]))
 		constVector.DataType = C.ConstGeoPoint
+	case *expr.UUIDLiteral:
+		uuidVal := val.(*expr.UUIDLiteral).Val
+		*(*C.UUIDT)(unsafe.Pointer(&constVector.Value)) = *(*C.UUIDT)(unsafe.Pointer(&uuidVal[0]))
+		constVector.DataType = C.ConstUUID
 	case *expr.NumberLiteral:
 		t := val.(*expr.NumberLiteral)
 		if t.Type() == expr.Float {
@@ -246,7 +272,7 @@ func makeConstantInput(val interface{}, isValid bool) C.InputVector {
 func makeScratchSpaceInput(values unsafe.Pointer, nulls unsafe.Pointer, dataType C.enum_DataType) C.InputVector {
 	var scratchSpaceVector C.ScratchSpaceVector
 	scratchSpaceVector.Values = (*C.uint8_t)(values)
-	scratchSpaceVector.NullsOffset = (C.uint32_t)(memutils.MemDist(nulls, values))
+	scratchSpaceVector.NullsOffset = (C.uint32_t)(utils.MemDist(nulls, values))
 	scratchSpaceVector.DataType = dataType
 
 	var vector C.InputVector
@@ -272,8 +298,8 @@ func makeMeasureVectorOutput(measureVector unsafe.Pointer, outputDataType C.enum
 func makeDimensionVectorOutput(dimensionVector unsafe.Pointer, valueOffset, nullOffset int, dataType C.enum_DataType) C.OutputVector {
 	var dimensionOutputVector C.DimensionOutputVector
 
-	dimensionOutputVector.DimValues = (*C.uint8_t)(memutils.MemAccess(dimensionVector, valueOffset))
-	dimensionOutputVector.DimNulls = (*C.uint8_t)(memutils.MemAccess(dimensionVector, nullOffset))
+	dimensionOutputVector.DimValues = (*C.uint8_t)(utils.MemAccess(dimensionVector, valueOffset))
+	dimensionOutputVector.DimNulls = (*C.uint8_t)(utils.MemAccess(dimensionVector, nullOffset))
 	dimensionOutputVector.DataType = dataType
 
 	var vector C.OutputVector
@@ -285,7 +311,7 @@ func makeDimensionVectorOutput(dimensionVector unsafe.Pointer, valueOffset, null
 func makeScratchSpaceOutput(values unsafe.Pointer, nulls unsafe.Pointer, dataType C.enum_DataType) C.OutputVector {
 	var scratchSpaceVector C.ScratchSpaceVector
 	scratchSpaceVector.Values = (*C.uint8_t)(values)
-	scratchSpaceVector.NullsOffset = (C.uint32_t)(memutils.MemDist(nulls, values))
+	scratchSpaceVector.NullsOffset = (C.uint32_t)(utils.MemDist(nulls, values))
 	scratchSpaceVector.DataType = dataType
 
 	var vector C.OutputVector
@@ -295,20 +321,25 @@ func makeScratchSpaceOutput(values unsafe.Pointer, nulls unsafe.Pointer, dataTyp
 	return vector
 }
 
-func makeDimensionColumnVector(dimensionVector, hashVector, indexVector unsafe.Pointer, numDims common.DimCountsPerDimWidth, vectorCapacity int) C.DimensionColumnVector {
-	var dimensionColumnVector C.DimensionColumnVector
-	dimensionColumnVector.DimValues = (*C.uint8_t)(dimensionVector)
-	dimensionColumnVector.HashValues = (*C.uint64_t)(hashVector)
-	dimensionColumnVector.IndexVector = (*C.uint32_t)(indexVector)
+func makeDimensionVector(valueVector, hashVector, indexVector unsafe.Pointer, numDims common.DimCountsPerDimWidth, vectorCapacity int) C.DimensionVector {
+	var dimensionVector C.DimensionVector
+	dimensionVector.DimValues = (*C.uint8_t)(valueVector)
+	dimensionVector.HashValues = (*C.uint64_t)(hashVector)
+	dimensionVector.IndexVector = (*C.uint32_t)(indexVector)
 
-	dimensionColumnVector.VectorCapacity = (C.int)(vectorCapacity)
+	dimensionVector.VectorCapacity = (C.int)(vectorCapacity)
 	for i := 0; i < len(numDims); i++ {
-		dimensionColumnVector.NumDimsPerDimWidth[i] = (C.uint8_t)(numDims[i])
+		dimensionVector.NumDimsPerDimWidth[i] = (C.uint8_t)(numDims[i])
 	}
-	return dimensionColumnVector
+	return dimensionVector
 }
 
 func getOutputDataType(exprType expr.Type, outputWidthInByte int) C.enum_DataType {
+	if exprType == expr.UUID {
+		return C.UUID
+	} else if exprType == expr.GeoPoint {
+		return C.GeoPoint
+	}
 	if outputWidthInByte == 4 {
 		switch exprType {
 		case expr.Float:
@@ -370,7 +401,7 @@ func (bc *oopkBatchContext) makeWriteToMeasureVectorAction(aggFunc C.enum_Aggreg
 		if bc.size <= 0 {
 			return
 		}
-		measureVector := memutils.MemAccess(bc.measureVectorD[0].getPointer(), bc.resultSize*outputWidthInByte)
+		measureVector := utils.MemAccess(bc.measureVectorD[0].getPointer(), bc.resultSize*outputWidthInByte)
 		// write measure out to measureVectorD[1] for hll query
 		if aggFunc == C.AGGR_HLL {
 			measureVector = bc.measureVectorD[1].getPointer()
@@ -399,8 +430,8 @@ func (bc *oopkBatchContext) makeWriteToDimensionVectorAction(valueOffset, nullOf
 			return
 		}
 
-		dataType := getDimensionDataType(exp)
-		dataBytes := getDimensionDataBytes(exp)
+		dataType := common.GetDimensionDataType(exp)
+		dataBytes := common.GetDimensionDataBytes(exp)
 		outputVector := makeDimensionVectorOutput(
 			bc.dimensionVectorD[0].getPointer(),
 			// move dimensionVectorD to the start position of current batch
@@ -427,7 +458,7 @@ func (bc *oopkBatchContext) makeWriteToDimensionVectorAction(valueOffset, nullOf
 	}
 }
 
-func makeCuckooHashIndex(primaryKeyData memstore.PrimaryKeyData, deviceData unsafe.Pointer) C.CuckooHashIndex {
+func makeCuckooHashIndex(primaryKeyData memCom.PrimaryKeyData, deviceData unsafe.Pointer) C.CuckooHashIndex {
 	var cuckooHashIndex C.CuckooHashIndex
 	cuckooHashIndex.buckets = (*C.uint8_t)(deviceData)
 	for index, seed := range primaryKeyData.Seeds {
@@ -490,7 +521,7 @@ func (bc *oopkBatchContext) processExpression(exp, parentExp expr.Expr, tableSca
 			return C.InputVector{}
 		}
 		return inputVector
-	case *expr.NumberLiteral, *expr.GeopointLiteral:
+	case *expr.NumberLiteral, *expr.GeopointLiteral, *expr.UUIDLiteral:
 		var inputVector C.InputVector
 		inputVector = makeConstantInput(e, true)
 		if action != nil {
@@ -510,18 +541,18 @@ func (bc *oopkBatchContext) processExpression(exp, parentExp expr.Expr, tableSca
 			return C.InputVector{}
 		}
 
-		values, nulls := bc.allocateStackFrame()
 		dataType := getOutputDataType(e.Type(), 4)
+		values, nulls := bc.allocateStackFrame(dataType)
 		var outputVector = makeScratchSpaceOutput(values.getPointer(), nulls.getPointer(), dataType)
 
-		C.UnaryTransform(inputVector, outputVector, (*C.uint32_t)(bc.indexVectorD.getPointer()),
-			(C.int)(bc.size), (*C.uint32_t)(bc.baseCountD.getPointer()), (C.uint32_t)(bc.startRow), functorType, stream, C.int(device))
+		doCGoCall(func() C.CGoCallResHandle {
+			return C.UnaryTransform(inputVector, outputVector, (*C.uint32_t)(bc.indexVectorD.getPointer()),
+				(C.int)(bc.size), (*C.uint32_t)(bc.baseCountD.getPointer()), (C.uint32_t)(bc.startRow), functorType, stream, C.int(device))
+		})
 
 		if inputVector.Type == C.ScratchSpaceInput {
 			bc.shrinkStackFrame()
 		}
-		bc.appendStackFrame(values, nulls)
-
 		return makeScratchSpaceInput(values.getPointer(), nulls.getPointer(), dataType)
 	case *expr.BinaryExpr:
 		lhsInputVector := bc.processExpression(e.LHS, e, tableScanners, foreignTables, stream, device, nil)
@@ -537,13 +568,16 @@ func (bc *oopkBatchContext) processExpression(exp, parentExp expr.Expr, tableSca
 			return C.InputVector{}
 		}
 
-		values, nulls := bc.allocateStackFrame()
 		outputDataType := getOutputDataType(e.Type(), 4)
+		values, nulls := bc.allocateStackFrame(outputDataType)
 		var outputVector = makeScratchSpaceOutput(values.getPointer(), nulls.getPointer(), outputDataType)
-		C.BinaryTransform(lhsInputVector, rhsInputVector, outputVector,
-			(*C.uint32_t)(bc.indexVectorD.getPointer()), (C.int)(bc.size), (*C.uint32_t)(bc.baseCountD.getPointer()),
-			(C.uint32_t)(bc.startRow),
-			functorType, stream, C.int(device))
+
+		doCGoCall(func() C.CGoCallResHandle {
+			return C.BinaryTransform(lhsInputVector, rhsInputVector, outputVector,
+				(*C.uint32_t)(bc.indexVectorD.getPointer()), (C.int)(bc.size), (*C.uint32_t)(bc.baseCountD.getPointer()),
+				(C.uint32_t)(bc.startRow),
+				functorType, stream, C.int(device))
+		})
 
 		if rhsInputVector.Type == C.ScratchSpaceInput {
 			bc.shrinkStackFrame()
@@ -552,9 +586,6 @@ func (bc *oopkBatchContext) processExpression(exp, parentExp expr.Expr, tableSca
 		if lhsInputVector.Type == C.ScratchSpaceInput {
 			bc.shrinkStackFrame()
 		}
-
-		bc.appendStackFrame(values, nulls)
-
 		return makeScratchSpaceInput(values.getPointer(), nulls.getPointer(), outputDataType)
 	default:
 		return C.InputVector{}
@@ -592,8 +623,8 @@ func (bc *oopkBatchContext) writeGeoShapeDim(geo *geoIntersection,
 	// move dimensionVectorD to the start position of current batch
 	// dimension vector start position + prevResultSize * dataBytes
 	// null vector start position + prevResultSize
-	dimensionOutputVector.DimValues = (*C.uint8_t)(memutils.MemAccess(dimensionVector, dimValueOffset+prevResultSize))
-	dimensionOutputVector.DimNulls = (*C.uint8_t)(memutils.MemAccess(dimensionVector, dimNullOffset+prevResultSize))
+	dimensionOutputVector.DimValues = (*C.uint8_t)(utils.MemAccess(dimensionVector, dimValueOffset+prevResultSize))
+	dimensionOutputVector.DimNulls = (*C.uint8_t)(utils.MemAccess(dimensionVector, dimNullOffset+prevResultSize))
 	dimensionOutputVector.DataType = C.Uint8
 
 	totalWords := (geo.numShapes + 31) / 32
@@ -629,9 +660,9 @@ func (bc *oopkBatchContext) geoIntersect(geo *geoIntersection, pointColumnIndex 
 
 func (bc *oopkBatchContext) hll(numDims common.DimCountsPerDimWidth, isLastBatch bool, stream unsafe.Pointer, device int) (
 	hllVector, dimRegCount devicePointer, hllVectorSize int64) {
-	prevDimOut := makeDimensionColumnVector(bc.dimensionVectorD[0].getPointer(), bc.hashVectorD[0].getPointer(),
+	prevDimOut := makeDimensionVector(bc.dimensionVectorD[0].getPointer(), bc.hashVectorD[0].getPointer(),
 		bc.dimIndexVectorD[0].getPointer(), numDims, bc.resultCapacity)
-	curDimOut := makeDimensionColumnVector(bc.dimensionVectorD[1].getPointer(), bc.hashVectorD[1].getPointer(),
+	curDimOut := makeDimensionVector(bc.dimensionVectorD[1].getPointer(), bc.hashVectorD[1].getPointer(),
 		bc.dimIndexVectorD[1].getPointer(), numDims, bc.resultCapacity)
 	prevValuesOut, curValuesOut := (*C.uint32_t)(bc.measureVectorD[0].getPointer()), (*C.uint32_t)(bc.measureVectorD[1].getPointer())
 	bc.resultSize = int(doCGoCall(func() C.CGoCallResHandle {
@@ -650,7 +681,7 @@ func (bc *oopkBatchContext) hll(numDims common.DimCountsPerDimWidth, isLastBatch
 }
 
 func (bc *oopkBatchContext) sortByKey(numDims common.DimCountsPerDimWidth, stream unsafe.Pointer, device int) {
-	keys := makeDimensionColumnVector(bc.dimensionVectorD[0].getPointer(), bc.hashVectorD[0].getPointer(),
+	keys := makeDimensionVector(bc.dimensionVectorD[0].getPointer(), bc.hashVectorD[0].getPointer(),
 		bc.dimIndexVectorD[0].getPointer(), numDims, bc.resultCapacity)
 	doCGoCall(func() C.CGoCallResHandle {
 		// sort the previous result with current batch together
@@ -660,9 +691,9 @@ func (bc *oopkBatchContext) sortByKey(numDims common.DimCountsPerDimWidth, strea
 
 func (bc *oopkBatchContext) reduceByKey(numDims common.DimCountsPerDimWidth, valueWidth int, aggFunc C.enum_AggregateFunction, stream unsafe.Pointer,
 	device int) {
-	inputKeys := makeDimensionColumnVector(
+	inputKeys := makeDimensionVector(
 		bc.dimensionVectorD[0].getPointer(), bc.hashVectorD[0].getPointer(), bc.dimIndexVectorD[0].getPointer(), numDims, bc.resultCapacity)
-	outputKeys := makeDimensionColumnVector(
+	outputKeys := makeDimensionVector(
 		bc.dimensionVectorD[1].getPointer(), bc.hashVectorD[1].getPointer(), bc.dimIndexVectorD[1].getPointer(), numDims, bc.resultCapacity)
 	inputValues, outputValues := (*C.uint8_t)(bc.measureVectorD[0].getPointer()), (*C.uint8_t)(bc.measureVectorD[1].getPointer())
 	bc.resultSize = int(doCGoCall(func() C.CGoCallResHandle {
@@ -671,33 +702,64 @@ func (bc *oopkBatchContext) reduceByKey(numDims common.DimCountsPerDimWidth, val
 	}))
 }
 
-func (bc *oopkBatchContext) expand(numDims common.DimCountsPerDimWidth, lenWanted int, stream unsafe.Pointer, device int) {
-	inputKeys := makeDimensionColumnVector(
+func (bc *oopkBatchContext) hashReduce(numDims common.DimCountsPerDimWidth, valueWidth int, aggFunc C.enum_AggregateFunction, stream unsafe.Pointer,
+	device int) {
+	inputKeys := makeDimensionVector(
 		bc.dimensionVectorD[0].getPointer(), bc.hashVectorD[0].getPointer(), bc.dimIndexVectorD[0].getPointer(), numDims, bc.resultCapacity)
-	outputKeys := makeDimensionColumnVector(
+	outputKeys := makeDimensionVector(
+		bc.dimensionVectorD[1].getPointer(), bc.hashVectorD[1].getPointer(), bc.dimIndexVectorD[1].getPointer(), numDims, bc.resultCapacity)
+	inputValues, outputValues := (*C.uint8_t)(bc.measureVectorD[0].getPointer()), (*C.uint8_t)(bc.measureVectorD[1].getPointer())
+	bc.resultSize = int(doCGoCall(func() C.CGoCallResHandle {
+		return C.HashReduce(inputKeys, inputValues, outputKeys, outputValues, (C.int)(valueWidth), (C.int)(bc.resultSize+bc.size), aggFunc,
+			stream, C.int(device))
+	}))
+}
+
+func (bc *oopkBatchContext) expand(numDims common.DimCountsPerDimWidth, stream unsafe.Pointer, device int) {
+	inputKeys := makeDimensionVector(
+		bc.dimensionVectorD[0].getPointer(), bc.hashVectorD[0].getPointer(), bc.dimIndexVectorD[0].getPointer(), numDims, bc.resultCapacity)
+	outputKeys := makeDimensionVector(
 		bc.dimensionVectorD[1].getPointer(), bc.hashVectorD[1].getPointer(), bc.dimIndexVectorD[1].getPointer(), numDims, bc.resultCapacity)
 
 	bc.resultSize = int(doCGoCall(func() C.CGoCallResHandle {
 		return C.Expand(inputKeys, outputKeys, (*C.uint32_t)(bc.baseCountD.getPointer()), (*C.uint32_t)(bc.indexVectorD.getPointer()),
-			C.int(lenWanted), C.int(bc.resultSize), stream, C.int(device))
+			C.int(bc.size), 0, stream, C.int(device))
 	}))
+	bc.dimensionVectorD[0], bc.dimensionVectorD[1] = bc.dimensionVectorD[1], bc.dimensionVectorD[0]
 }
 
-func (bc *oopkBatchContext) allocateStackFrame() (values, nulls devicePointer) {
+func (bc *oopkBatchContext) getDataTypeLength(dataType C.enum_DataType) int {
+	switch dataType {
+	case C.Int64, C.Uint64, C.Float64:
+		return 8
+	case C.GeoPoint:
+		return 8
+	case C.UUID:
+		return 16
+	default:
+		return 4
+	}
+}
+
+// allocate new stack frame and append to the end of the stack
+func (bc *oopkBatchContext) allocateStackFrame(dataType C.enum_DataType) (values, nulls devicePointer) {
+	dataTypeLen := bc.getDataTypeLength(dataType)
 	// width bytes * bc.size (value buffer) + 1 byte * bc.size (null buffer)
-	valuesPointer := deviceAllocate((4+1)*bc.size, bc.device)
-	nullsPointer := valuesPointer.offset(4 * bc.size)
+	valuesPointer := deviceAllocate((dataTypeLen+1)*bc.size, bc.device)
+	nullsPointer := valuesPointer.offset(dataTypeLen * bc.size)
+	// append output buffer to the end
+	bc.exprStackD = append(bc.exprStackD, [2]devicePointer{valuesPointer, nullsPointer})
 	return valuesPointer, nullsPointer
 }
 
+// shrink stack by one, but keep top element as is
 func (bc *oopkBatchContext) shrinkStackFrame() {
 	var stackFrame [2]devicePointer
+	// swap last two elements
+	bc.exprStackD[len(bc.exprStackD)-1], bc.exprStackD[len(bc.exprStackD)-2] = bc.exprStackD[len(bc.exprStackD)-2], bc.exprStackD[len(bc.exprStackD)-1]
+	// pop last element
 	stackFrame, bc.exprStackD = bc.exprStackD[len(bc.exprStackD)-1], bc.exprStackD[:len(bc.exprStackD)-1]
 	deviceFreeAndSetNil(&stackFrame[0])
-}
-
-func (bc *oopkBatchContext) appendStackFrame(values, nulls devicePointer) {
-	bc.exprStackD = append(bc.exprStackD, [2]devicePointer{values, nulls})
 }
 
 func (qc *AQLQueryContext) createCutoffTimeFilter(cutoff uint32) expr.Expr {

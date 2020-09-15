@@ -36,12 +36,12 @@ func NewHealthCheckHandler() *HealthCheckHandler {
 }
 
 // HealthCheck is the HealthCheck endpoint.
-func (handler *HealthCheckHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
+func (handler *HealthCheckHandler) HealthCheck(w *utils.ResponseWriter, r *http.Request) {
 	handler.RLock()
 	disabled := handler.disable
 	handler.RUnlock()
 	if disabled {
-		RespondBytesWithCode(w, http.StatusServiceUnavailable, []byte("Health check disabled"))
+		w.WriteBytesWithCode(http.StatusServiceUnavailable, []byte("Health check disabled"))
 	} else {
 		io.WriteString(w, "OK")
 	}

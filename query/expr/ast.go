@@ -23,9 +23,11 @@ package expr
 import (
 	"bytes"
 	"fmt"
+	"github.com/gofrs/uuid"
 	memCom "github.com/uber/aresdb/memstore/common"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
 // Type defines data types for expression evaluation.
@@ -41,6 +43,7 @@ const (
 	Float
 	GeoPoint
 	GeoShape
+	UUID
 )
 
 var typeNames = map[Type]string{
@@ -51,7 +54,32 @@ var typeNames = map[Type]string{
 	Float:       "Float",
 	GeoPoint:    "GeoPoint",
 	GeoShape:    "GeoShape",
+	UUID:        "UUID",
 }
+
+// constants for call names.
+const (
+	ConvertTzCallName           = "convert_tz"
+	CountCallName               = "count"
+	DayOfWeekCallName           = "dayofweek"
+	FromUnixTimeCallName        = "from_unixtime"
+	GeographyIntersectsCallName = "geography_intersects"
+	HexCallName                 = "hex"
+	// hll aggregation function applies to hll columns
+	HllCallName = "hll"
+	// countdistincthll aggregation function applies to all columns, hll value is computed on the fly
+	CountDistinctHllCallName = "countdistincthll"
+	HourCallName             = "hour"
+	ListCallName             = ""
+	MaxCallName              = "max"
+	MinCallName              = "min"
+	SumCallName              = "sum"
+	AvgCallName              = "avg"
+	// array functions
+	LengthCallName    = "length"
+	ContainsCallName  = "contains"
+	ElementAtCallName = "element_at"
+)
 
 func (t Type) String() string {
 	return typeNames[t]
@@ -85,6 +113,7 @@ func (*UnknownLiteral) expr()  {}
 func (*VarRef) expr()          {}
 func (*Wildcard) expr()        {}
 func (*GeopointLiteral) expr() {}
+func (*UUIDLiteral) expr()     {}
 
 // walkNames will walk the Expr and return the database fields
 func walkNames(exp Expr) []string {
@@ -292,7 +321,12 @@ func (l *NumberLiteral) String() string {
 	if l.Expr != "" {
 		return l.Expr
 	}
-	return strconv.FormatFloat(l.Val, 'f', 3, 64)
+
+	if l.Type() == Float {
+		return strconv.FormatFloat(l.Val, 'f', 3, 64)
+	}
+
+	return strconv.FormatInt(int64(l.Int), 10)
 }
 
 // BooleanLiteral represents a boolean literal.
@@ -355,6 +389,25 @@ func (l *GeopointLiteral) Type() Type {
 // String returns a string representation of the literal.
 func (l *GeopointLiteral) String() string {
 	return fmt.Sprintf("point(%f, %f)", l.Val[0], l.Val[1])
+}
+
+// UUIDLiteral represents a literal for UUID
+type UUIDLiteral struct {
+	Val [2]uint64
+}
+
+// Type returns the type.
+func (l *UUIDLiteral) Type() Type {
+	return UUID
+}
+
+// String returns a string representation of the literal.
+func (l *UUIDLiteral) String() string {
+	uuidBytes := *(*[]byte)(unsafe.Pointer(&l.Val[0]))
+	if uuidVal, err := uuid.FromBytes(uuidBytes); err != nil {
+		return uuidVal.String()
+	}
+	return ""
 }
 
 // NullLiteral represents a NULL literal.
@@ -597,3 +650,34 @@ func RewriteFunc(e Expr, fn func(Expr) Expr) Expr {
 type rewriterFunc func(Expr) Expr
 
 func (fn rewriterFunc) Rewrite(e Expr) Expr { return fn(e) }
+
+// IsUUIDColumn returns whether an Expr is UUID
+func IsUUIDColumn(expression Expr) bool {
+	if varRef, ok := expression.(*VarRef); ok {
+		return varRef.DataType == memCom.UUID
+	}
+	return false
+}
+
+// Cast returns an expression that casts the input to the desired type.
+// The returned expression AST will be used directly for VM instruction
+// generation of the desired types.
+func Cast(e Expr, t Type) Expr {
+	// Input type is already desired.
+	if e.Type() == t {
+		return e
+	}
+	// Type casting is only required if at least one side is float.
+	// We do not cast (or check for overflow) among boolean, signed and unsigned.
+	if e.Type() != Float && t != Float {
+		return e
+	}
+	// Data type for NumberLiteral can be changed directly.
+	l, _ := e.(*NumberLiteral)
+	if l != nil {
+		l.ExprType = t
+		return l
+	}
+	// Use ParenExpr to respresent a VM type cast.
+	return &ParenExpr{Expr: e, ExprType: t}
+}

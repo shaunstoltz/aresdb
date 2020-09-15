@@ -19,16 +19,19 @@ namespace ares {
 
 template<int NInput, typename FunctorType>
 int OutputVectorBinder<NInput, FunctorType>::transformScratchSpaceOutput(
-    ScratchSpaceVector output) {
+    ScratchSpaceVector output) const {
   switch (output.DataType) {
     #define BIND_SCRATCH__SPACE_OUTPUT(dataType) \
     return transform(ares::make_scratch_space_output_iterator( \
           reinterpret_cast<dataType *>(output.Values), \
           output.NullsOffset));
 
-    case Int32:BIND_SCRATCH__SPACE_OUTPUT(int32_t)
-    case Uint32:BIND_SCRATCH__SPACE_OUTPUT(uint32_t)
-    case Float32:BIND_SCRATCH__SPACE_OUTPUT(float_t)
+    case Int32:    BIND_SCRATCH__SPACE_OUTPUT(int32_t)
+    case Uint32:   BIND_SCRATCH__SPACE_OUTPUT(uint32_t)
+    case Float32:  BIND_SCRATCH__SPACE_OUTPUT(float_t)
+    case Int64:    BIND_SCRATCH__SPACE_OUTPUT(int64_t)
+    case UUID:     BIND_SCRATCH__SPACE_OUTPUT(UUIDT)
+    case GeoPoint: BIND_SCRATCH__SPACE_OUTPUT(GeoPointT)
     default:throw
       std::invalid_argument(
           "Unsupported data type for ScratchSpaceOutput");
@@ -38,10 +41,10 @@ int OutputVectorBinder<NInput, FunctorType>::transformScratchSpaceOutput(
 // explicit instantiations.
 template int OutputVectorBinder<1,
                                 UnaryFunctorType>::transformScratchSpaceOutput(
-    ScratchSpaceVector output);
+    ScratchSpaceVector output) const;
 
 template int OutputVectorBinder<2,
                                 BinaryFunctorType>::transformScratchSpaceOutput(
-    ScratchSpaceVector output);
+    ScratchSpaceVector output) const;
 
 }  // namespace ares

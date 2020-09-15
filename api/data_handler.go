@@ -15,9 +15,12 @@
 package api
 
 import (
+	"github.com/m3db/m3/src/x/sync"
 	"net/http"
 
+	"github.com/uber/aresdb/api/common"
 	"github.com/uber/aresdb/memstore"
+	memCom "github.com/uber/aresdb/memstore/common"
 	"github.com/uber/aresdb/utils"
 
 	"github.com/gorilla/mux"
@@ -25,19 +28,23 @@ import (
 
 // DataHandler handles data ingestion requests from the ingestion pipeline.
 type DataHandler struct {
-	memStore memstore.MemStore
+	memStore   memstore.MemStore
+	workerPool sync.WorkerPool
 }
 
 // NewDataHandler creates a new DataHandler.
-func NewDataHandler(memStore memstore.MemStore) *DataHandler {
+func NewDataHandler(memStore memstore.MemStore, maxConcurrentRequests int) *DataHandler {
+	workerPool := sync.NewWorkerPool(maxConcurrentRequests)
+	workerPool.Init()
 	return &DataHandler{
-		memStore: memStore,
+		memStore:   memStore,
+		workerPool: workerPool,
 	}
 }
 
 // Register registers http handlers.
 func (handler *DataHandler) Register(router *mux.Router, wrappers ...utils.HTTPHandlerWrapper) {
-	router.HandleFunc("/{table}/{shard}", utils.ApplyHTTPWrappers(handler.PostData, wrappers)).Methods(http.MethodPost)
+	router.HandleFunc("/{table}/{shard}", utils.ApplyHTTPWrappers(handler.PostData, wrappers...)).Methods(http.MethodPost)
 }
 
 // PostData swagger:route POST /data/{table}/{shard} postData
@@ -48,25 +55,34 @@ func (handler *DataHandler) Register(router *mux.Router, wrappers ...utils.HTTPH
 // Responses:
 //    default: errorResponse
 //        200: noContentResponse
-func (handler *DataHandler) PostData(w http.ResponseWriter, r *http.Request) {
+func (handler *DataHandler) PostData(w *utils.ResponseWriter, r *http.Request) {
 	var postDataRequest PostDataRequest
-	err := ReadRequest(r, &postDataRequest)
+	err := common.ReadRequest(r, &postDataRequest)
 	if err != nil {
-		RespondWithError(w, err)
+		w.WriteError(err)
 		return
 	}
 
-	upsertBatch, err := memstore.NewUpsertBatch(postDataRequest.Body)
+	upsertBatch, err := memCom.NewUpsertBatch(postDataRequest.Body)
 	if err != nil {
-		RespondWithBadRequest(w, err)
+		w.WriteErrorWithCode(http.StatusBadRequest, err)
 		return
 	}
 
-	err = handler.memStore.HandleIngestion(postDataRequest.TableName, postDataRequest.Shard, upsertBatch)
-	if err != nil {
-		RespondWithError(w, err)
+	done := make(chan struct{})
+	available := handler.workerPool.GoIfAvailable(func() {
+		defer close(done)
+		err = handler.memStore.HandleIngestion(postDataRequest.TableName, postDataRequest.Shard, upsertBatch)
+		if err != nil {
+			w.WriteError(err)
+			return
+		}
+		w.WriteObject(nil)
+	})
+
+	if !available {
+		w.WriteError(common.ErrIngestionServiceNotAvailable)
 		return
 	}
-
-	RespondWithJSONObject(w, nil)
+	<-done
 }

@@ -19,7 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/uber/aresdb/metastore"
+	metaCom "github.com/uber/aresdb/metastore/common"
 	"github.com/uber/aresdb/utils"
 
 	rbt "github.com/emirpasic/gods/trees/redblacktree"
@@ -37,7 +37,7 @@ type preloadJob struct {
 type hostMemoryManager struct {
 	sync.RWMutex
 	memStore  *memStoreImpl
-	metaStore metastore.MetaStore
+	metaStore metaCom.MetaStore
 	// totalMemorySize is configurable uplimit.
 	totalMemorySize int64
 	// unManagedMemorySize and managedMemorySize reflect current memory usage status.
@@ -207,7 +207,6 @@ func (h *hostMemoryManager) ReportManagedObject(table string, shard, batchID, co
 // Start will do a blocking preloading first and then start the go routines to do
 // data preloading and eviction.
 func (h *hostMemoryManager) Start() {
-	h.preloadAll()
 	utils.GetLogger().Info("HostMemoryManager: initial preloading done")
 	// Preloader execution loop.
 	go func() {
@@ -277,7 +276,8 @@ func (h *hostMemoryManager) GetArchiveMemoryUsageByTableShard() (map[string]map[
 	for tableName, batchInfoByColumn := range h.batchInfosByColumn {
 		tableSchema, err := h.memStore.GetSchema(tableName)
 		if err != nil {
-			return managedMemoryUsage, err
+			// ignore deleted table
+			continue
 		}
 		for columnID, batchInfo := range batchInfoByColumn {
 			tableSchema.RLock()
@@ -365,48 +365,6 @@ func (h *hostMemoryManager) deleteManagedObject(table string, shard, batchID, co
 	}
 	h.Unlock()
 	utils.GetLogger().Debugf("deleteManagedObject(%s,%d,%d,%d), bytesChange = %d, managedMemorySize=%d\n ", table, shard, batchID, columnID, bytesChange, h.getManagedSpaceUsage())
-}
-
-// preloadAll preloads recent days data for all columns of all table shards into memory.
-// The number of preloading days is defined at each column level. This call will happen at
-// shard initialization stage.
-func (h *hostMemoryManager) preloadAll() {
-	tableShardSnapshot := make(map[string][]int)
-
-	// snapshot (tableName, shardID)s.
-	h.memStore.RLock()
-	for tableName, shardMap := range h.memStore.TableShards {
-		tableShardSnapshot[tableName] = make([]int, 0, len(shardMap))
-		for shardID := range shardMap {
-			tableShardSnapshot[tableName] = append(tableShardSnapshot[tableName], shardID)
-		}
-	}
-	h.memStore.RUnlock()
-
-	currentDay := int(utils.Now().Unix() / 86400)
-	for tableName, shardIDs := range tableShardSnapshot {
-		for _, shardID := range shardIDs {
-			tableShard, err := h.memStore.GetTableShard(tableName, shardID)
-			// Table shard may have already been removed from this node.
-			if err != nil {
-				continue
-			}
-			tableShard.Schema.RLock()
-			columns := tableShard.Schema.Schema.Columns
-			tableShard.Schema.RUnlock()
-			if tableShard.Schema.Schema.IsFactTable {
-				archiveStoreVersion := tableShard.ArchiveStore.GetCurrentVersion()
-				for columnID, column := range columns {
-					if !column.Deleted {
-						preloadingDays := column.Config.PreloadingDays
-						tableShard.PreloadColumn(columnID, currentDay-preloadingDays, currentDay)
-					}
-				}
-				archiveStoreVersion.Users.Done()
-			}
-			tableShard.Users.Done()
-		}
-	}
 }
 
 // handleColumnPreloadingDaysChange handles the preloading config change for a column.

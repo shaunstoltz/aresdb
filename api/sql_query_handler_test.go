@@ -17,11 +17,13 @@ package api
 import (
 	"bytes"
 	"fmt"
+	"github.com/uber/aresdb/cluster/topology"
+	"github.com/uber/aresdb/utils"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 
-	"github.com/uber/aresdb/memstore"
+	memCom "github.com/uber/aresdb/memstore/common"
 	memMocks "github.com/uber/aresdb/memstore/mocks"
 	metaCom "github.com/uber/aresdb/metastore/common"
 
@@ -33,7 +35,7 @@ import (
 
 var _ = ginkgo.Describe("QueryHandler SQL", func() {
 	var testServer *httptest.Server
-	var testSchema = memstore.NewTableSchema(&metaCom.Table{
+	var testSchema = memCom.NewTableSchema(&metaCom.Table{
 		Name:        "trips",
 		IsFactTable: false,
 		Columns: []metaCom.Column{
@@ -62,11 +64,14 @@ var _ = ginkgo.Describe("QueryHandler SQL", func() {
 	var memStore *memMocks.MemStore
 	ginkgo.BeforeEach(func() {
 		memStore = CreateMemStore(testSchema, 0, nil, CreateMockDiskStore())
-		queryHandler := NewQueryHandler(memStore, common.QueryConfig{
-			DeviceMemoryUtilization: 1.0,
-		})
+		queryHandler := NewQueryHandler(
+			memStore,
+			topology.NewStaticShardOwner([]int{0}),
+			common.QueryConfig{
+				DeviceMemoryUtilization: 1.0,
+			}, 10)
 		testRouter := mux.NewRouter()
-		testRouter.HandleFunc("/sql", queryHandler.HandleSQL).Methods(http.MethodGet, http.MethodPost)
+		testRouter.HandleFunc("/sql", utils.ApplyHTTPWrappers(queryHandler.HandleSQL)).Methods(http.MethodGet, http.MethodPost)
 		testServer = httptest.NewUnstartedServer(WithPanicHandling(testRouter))
 		testServer.Start()
 	})

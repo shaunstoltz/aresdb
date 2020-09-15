@@ -15,14 +15,14 @@
 package memstore
 
 import (
+	"encoding/json"
+	"github.com/uber/aresdb/memstore/vectors"
 	"math"
 	"sync"
 	"time"
 
-	"encoding/json"
-
 	"github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/memutils"
+	"github.com/uber/aresdb/redolog"
 	"github.com/uber/aresdb/utils"
 )
 
@@ -32,7 +32,7 @@ const BaseBatchID = int32(math.MinInt32)
 // LiveBatch represents a live batch.
 type LiveBatch struct {
 	// The common data structure holding column data.
-	Batch
+	common.Batch
 
 	// Capacity of the batch which is decided at the creation time.
 	Capacity int
@@ -58,7 +58,7 @@ type LiveStore struct {
 	BatchSize int
 
 	// The upper bound of records (exclusive) that can be read by queries.
-	LastReadRecord RecordID
+	LastReadRecord common.RecordID
 
 	// This is the in memory archiving cutoff time high watermark that gets set by the archiving job
 	// before each archiving run. Ingestion will not insert/update records that are older than
@@ -66,7 +66,7 @@ type LiveStore struct {
 	ArchivingCutoffHighWatermark uint32
 
 	// Logs.
-	RedoLogManager RedoLogManager
+	RedoLogManager redolog.RedologManager
 
 	// Manage backfill queue during ingestion.
 	BackfillManager *BackfillManager
@@ -75,7 +75,7 @@ type LiveStore struct {
 	SnapshotManager *SnapshotManager
 
 	// For convenience. Schema locks should be acquired after data locks.
-	tableSchema *TableSchema
+	tableSchema *common.TableSchema
 
 	// The writer lock is to guarantee single writer to a Shard at all time. To ensure this, writers
 	// (ingestion, archiving etc) need to hold this lock at all times. This lock
@@ -87,10 +87,10 @@ type LiveStore struct {
 	// Following fields are protected by WriterLock.
 
 	// Primary key table of the Shard.
-	PrimaryKey PrimaryKey
+	PrimaryKey common.PrimaryKey
 
 	// The position of the next record to be used for writing. Only used by the ingester.
-	NextWriteRecord RecordID
+	NextWriteRecord common.RecordID
 
 	// For convenience.
 	HostMemoryManager common.HostMemoryManager `json:"-"`
@@ -102,24 +102,35 @@ type LiveStore struct {
 }
 
 // NewLiveStore creates a new live batch.
-func NewLiveStore(batchSize int, shard *TableShard) *LiveStore {
+func NewLiveStore(batchSize int, totalShards int, shard *TableShard) *LiveStore {
 	schema := shard.Schema
 	tableCfg := schema.Schema.Config
+	// for now dimension table is unsharded
+	unsharded := !schema.Schema.IsFactTable
+	redoLogManager, err := shard.options.redoLogMaster.NewRedologManager(schema.Schema.Name, shard.ShardID, unsharded, &tableCfg)
+	if err != nil {
+		utils.GetLogger().Fatal(err)
+	}
 	ls := &LiveStore{
 		BatchSize:       batchSize,
 		Batches:         make(map[int32]*LiveBatch),
 		tableSchema:     schema,
-		LastReadRecord:  RecordID{BatchID: BaseBatchID, Index: 0},
-		NextWriteRecord: RecordID{BatchID: BaseBatchID, Index: 0},
-		PrimaryKey:      NewPrimaryKey(schema.PrimaryKeyBytes, schema.Schema.IsFactTable, schema.Schema.Config.InitialPrimaryKeyNumBuckets, shard.HostMemoryManager),
-		// TODO: support table specific log rotation interval.
-		RedoLogManager: NewRedoLogManager(int64(tableCfg.RedoLogRotationInterval), int64(tableCfg.MaxRedoLogFileSize),
-			shard.diskStore, schema.Schema.Name, shard.ShardID),
+		LastReadRecord:  common.RecordID{BatchID: BaseBatchID, Index: 0},
+		NextWriteRecord: common.RecordID{BatchID: BaseBatchID, Index: 0},
+		PrimaryKey: NewPrimaryKey(schema.PrimaryKeyBytes, schema.Schema.IsFactTable,
+			// initial primary key buckets should consider number of shards
+			schema.Schema.Config.InitialPrimaryKeyNumBuckets/totalShards,
+			shard.HostMemoryManager),
+		RedoLogManager:    redoLogManager,
 		HostMemoryManager: shard.HostMemoryManager,
 	}
 
 	if schema.Schema.IsFactTable {
-		ls.BackfillManager = NewBackfillManager(schema.Schema.Name, shard.ShardID, schema.Schema.Config)
+		ls.BackfillManager = NewBackfillManager(schema.Schema.Name, shard.ShardID, BackfillConfig{
+			// MaxBufferSize should consider total number of shards
+			MaxBufferSize:            tableCfg.BackfillMaxBufferSize / int64(totalShards),
+			BackfillThresholdInBytes: tableCfg.BackfillThresholdInBytes,
+		})
 		// reportBatch memory usage of backfill max buffer size.
 		ls.HostMemoryManager.ReportUnmanagedSpaceUsageChange(
 			int64(ls.BackfillManager.MaxBufferSize * utils.GolangMemoryFootprintFactor))
@@ -185,7 +196,7 @@ func (s *LiveStore) getOrCreateBatch(batchID int32) *LiveBatch {
 
 // AdvanceNextWriteRecord reserves space for a record that return the next available record position
 // back to the caller.
-func (s *LiveStore) AdvanceNextWriteRecord() RecordID {
+func (s *LiveStore) AdvanceNextWriteRecord() common.RecordID {
 	s.RLock()
 	batch := s.Batches[s.NextWriteRecord.BatchID]
 	s.RUnlock()
@@ -221,7 +232,7 @@ func (s *LiveStore) appendBatch(batchID int32) *LiveBatch {
 	numColumns := len(valueTypeByColumn)
 
 	batch := &LiveBatch{
-		Batch: Batch{
+		Batch: common.Batch{
 			RWMutex: &sync.RWMutex{},
 			Columns: make([]common.VectorParty, numColumns),
 		},
@@ -277,7 +288,6 @@ func (s *LiveStore) Destruct() {
 				-int64(s.BackfillManager.MaxBufferSize * utils.GolangMemoryFootprintFactor))
 		}()
 	}
-	s.RedoLogManager.Close()
 }
 
 // PurgeBatches purges the specified batches.
@@ -329,7 +339,7 @@ func (s *LiveStore) MarshalJSON() ([]byte, error) {
 
 	// Following fields are protected by writer lock of liveStore.
 	s.WriterLock.RLock()
-	pkJSON, err := MarshalPrimaryKey(s.PrimaryKey)
+	pkJSON, err := common.MarshalPrimaryKey(s.PrimaryKey)
 	if err != nil {
 		s.WriterLock.RUnlock()
 		return nil, err
@@ -342,17 +352,17 @@ func (s *LiveStore) MarshalJSON() ([]byte, error) {
 }
 
 // LookupKey looks up the given key in primary key.
-func (s *LiveStore) LookupKey(keyStrs []string) (RecordID, bool) {
+func (s *LiveStore) LookupKey(keyStrs []string) (common.RecordID, bool) {
 	key := make([]byte, s.tableSchema.PrimaryKeyBytes)
 	if len(s.tableSchema.PrimaryKeyColumnTypes) != len(keyStrs) {
-		return RecordID{}, false
+		return common.RecordID{}, false
 	}
 
 	index := 0
 	for colIndex, columnType := range s.tableSchema.PrimaryKeyColumnTypes {
 		dataValue, err := common.ValueFromString(keyStrs[colIndex], columnType)
 		if err != nil || !dataValue.Valid {
-			return RecordID{}, false
+			return common.RecordID{}, false
 		}
 
 		if dataValue.IsBool {
@@ -364,7 +374,7 @@ func (s *LiveStore) LookupKey(keyStrs []string) (RecordID, bool) {
 			index++
 		} else {
 			for i := 0; i < common.DataTypeBits(columnType)/8; i++ {
-				key[index] = *(*byte)(memutils.MemAccess(dataValue.OtherVal, i))
+				key[index] = *(*byte)(utils.MemAccess(dataValue.OtherVal, i))
 				index++
 			}
 		}
@@ -419,7 +429,7 @@ func (b *LiveBatch) GetOrCreateVectorParty(columnID int, locked bool) common.Liv
 		defaultValue := *b.liveStore.tableSchema.DefaultValues[columnID]
 		b.liveStore.tableSchema.RUnlock()
 
-		bytes := CalculateVectorPartyBytes(dataType, b.Capacity, true, false)
+		bytes := vectors.CalculateVectorPartyBytes(dataType, b.Capacity, true, false)
 		b.liveStore.HostMemoryManager.ReportUnmanagedSpaceUsageChange(int64(bytes))
 		liveVP := NewLiveVectorParty(b.Capacity, dataType, defaultValue, b.liveStore.HostMemoryManager)
 		liveVP.Allocate(false)

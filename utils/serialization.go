@@ -96,6 +96,14 @@ func (b BufferReader) ReadUint64(offset int) (uint64, error) {
 	return *(*uint64)(unsafe.Pointer(&b.buffer[offset])), nil
 }
 
+// ReadInt64 reads 8 bytes from buffer.
+func (b BufferReader) ReadInt64(offset int) (int64, error) {
+	if offset+8 > len(b.buffer) {
+		return 0, StackError(nil, "Failed to read int64 from offset %d", offset)
+	}
+	return *(*int64)(unsafe.Pointer(&b.buffer[offset])), nil
+}
+
 // ReadFloat32 reads 4 bytes from buffer.
 func (b BufferReader) ReadFloat32(offset int) (float32, error) {
 	if offset+4 > len(b.buffer) {
@@ -366,22 +374,27 @@ func (b *BufferWriter) WriteAt(bs []byte, offset int64) (int, error) {
 	return len(bs), nil
 }
 
-// ClosableBuffer is not really closable but just implements the io.WriteCloser interface.
+// ClosableBuffer is not really closable but just implements the utils.WriteSyncCloser interface.
 type ClosableBuffer struct {
 	*bytes.Buffer
 }
 
-// Close just implements Close function of io.WriteCloser interface.
+// Close just implements Close function of utils.WriteSyncCloser interface.
 func (cb *ClosableBuffer) Close() error {
 	return nil
 }
 
-// ClosableReader is not really closable but just implements the io.ReadCloser interface.
+// ClosableReader is not really closable but just implements the utils.WriteSyncCloser interface.
 type ClosableReader struct {
 	*bytes.Reader
 }
 
-// Close just implements Close function of io.ReadCloser interface.
+// Close just implements Close function of utils.WriteSyncCloser interface.
 func (cr *ClosableReader) Close() error {
+	return nil
+}
+
+// Sync just implements Sync function of utils.WriteSyncCloser interface.
+func (cr *ClosableBuffer) Sync() error {
 	return nil
 }

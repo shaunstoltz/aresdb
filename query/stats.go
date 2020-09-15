@@ -17,12 +17,12 @@ package query
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/uber/aresdb/cgoutils"
 	"math"
 	"sort"
 	"time"
 	"unsafe"
 
-	"github.com/uber/aresdb/memutils"
 	"github.com/uber/aresdb/utils"
 )
 
@@ -44,9 +44,11 @@ const (
 	hllEvalTiming                           = "hllEval"
 	sortEvalTiming                          = "sortEval"
 	reduceEvalTiming                        = "reduceEval"
+	hashReduceEvalTiming                    = "hashReduceEval"
 	expandEvalTiming                        = "expandEval"
 	cleanupTiming                           = "cleanUpEval"
 	resultTransferTiming                    = "resultTransfer"
+	resultFlushTiming                       = "resultFlush"
 	finalCleanupTiming                      = "finalCleanUp"
 )
 
@@ -157,7 +159,7 @@ func (stats oopkQueryStats) ColumnHeaders() []string {
 // It will add to the total timing as well. Therefore this function should only be called one time for each stage.
 func (qc *AQLQueryContext) reportTimingForCurrentBatch(stream unsafe.Pointer, start *time.Time, name stageName) {
 	if qc.Debug {
-		memutils.WaitForCudaStream(stream, qc.Device)
+		cgoutils.WaitForCudaStream(stream, qc.Device)
 		now := utils.Now()
 		value := now.Sub(*start).Seconds() * 1000
 		qc.OOPK.currentBatch.stats.timings[name] = value
@@ -166,12 +168,12 @@ func (qc *AQLQueryContext) reportTimingForCurrentBatch(stream unsafe.Pointer, st
 	}
 }
 
-// reportTimingForCurrentBatch is similar to reportTimingForCurrentBatch except that it modifies the query stats for the
+// reportTiming is similar to reportTimingForCurrentBatch except that it modifies the query stats for the
 // whole query. It's usually should be called once for each stage
 func (qc *AQLQueryContext) reportTiming(stream unsafe.Pointer, start *time.Time, name stageName) {
 	if qc.Debug {
 		if stream != nil {
-			memutils.WaitForCudaStream(stream, qc.Device)
+			cgoutils.WaitForCudaStream(stream, qc.Device)
 		}
 		now := utils.Now()
 		value := now.Sub(*start).Seconds() * 1000

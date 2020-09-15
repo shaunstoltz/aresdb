@@ -46,7 +46,7 @@ var _ = ginkgo.Describe("job manager", func() {
 	})
 
 	mockErr := errors.New("UpdateArchivingCutoff fails")
-	m := getFactory().NewMockMemStore()
+	m := GetFactory().NewMockMemStore()
 	(m.metaStore).(*metaMocks.MetaStore).On(
 		"UpdateArchivingCutoff", sysmock.Anything, sysmock.Anything, sysmock.Anything).Return(mockErr)
 
@@ -55,7 +55,7 @@ var _ = ginkgo.Describe("job manager", func() {
 
 	hostMemoryManager := NewHostMemoryManager(m, 1<<32)
 
-	shard1 := NewTableShard(&TableSchema{
+	shard1 := NewTableShard(&memCom.TableSchema{
 		Schema: metaCom.Table{
 			Name: table1,
 			Config: metaCom.TableConfig{
@@ -66,7 +66,7 @@ var _ = ginkgo.Describe("job manager", func() {
 			},
 			IsFactTable: true,
 		},
-	}, m.metaStore, m.diskStore, hostMemoryManager, 1)
+	}, m.metaStore, m.diskStore, hostMemoryManager, 1, 1, m.options)
 
 	shard1.ArchiveStore = &ArchiveStore{
 		PurgeManager: NewPurgeManager(shard1),
@@ -75,7 +75,7 @@ var _ = ginkgo.Describe("job manager", func() {
 		},
 	}
 
-	shard2 := NewTableShard(&TableSchema{
+	shard2 := NewTableShard(&memCom.TableSchema{
 		Schema: metaCom.Table{
 			Name: table1,
 			Config: metaCom.TableConfig{
@@ -86,7 +86,7 @@ var _ = ginkgo.Describe("job manager", func() {
 			},
 			IsFactTable: true,
 		},
-	}, m.metaStore, m.diskStore, hostMemoryManager, 2)
+	}, m.metaStore, m.diskStore, hostMemoryManager, 2, 1, m.options)
 
 	shard2.LiveStore.BackfillManager.CurrentBufferSize = 15
 
@@ -97,7 +97,7 @@ var _ = ginkgo.Describe("job manager", func() {
 		},
 	}
 
-	shard3 := NewTableShard(&TableSchema{
+	shard3 := NewTableShard(&memCom.TableSchema{
 		Schema: metaCom.Table{
 			Name: table2,
 			Config: metaCom.TableConfig{
@@ -109,7 +109,7 @@ var _ = ginkgo.Describe("job manager", func() {
 			},
 			IsFactTable: true,
 		},
-	}, m.metaStore, m.diskStore, hostMemoryManager, 1)
+	}, m.metaStore, m.diskStore, hostMemoryManager, 1, 1, m.options)
 
 	shard3.LiveStore.BackfillManager.CurrentBufferSize = 15
 
@@ -120,7 +120,7 @@ var _ = ginkgo.Describe("job manager", func() {
 		},
 	}
 
-	shard4 := NewTableShard(&TableSchema{
+	shard4 := NewTableShard(&memCom.TableSchema{
 		Schema: metaCom.Table{
 			Name: table3,
 			Config: metaCom.TableConfig{
@@ -129,7 +129,7 @@ var _ = ginkgo.Describe("job manager", func() {
 			},
 			IsFactTable: false,
 		},
-	}, m.metaStore, m.diskStore, hostMemoryManager, 1)
+	}, m.metaStore, m.diskStore, hostMemoryManager, 1, 1, m.options)
 
 	shard4.LiveStore.SnapshotManager.NumMutations = 200
 

@@ -19,7 +19,7 @@ import (
 
 	"encoding/json"
 
-	"github.com/uber/aresdb/metastore"
+	memCom "github.com/uber/aresdb/memstore/common"
 	metaCom "github.com/uber/aresdb/metastore/common"
 	"github.com/uber/aresdb/utils"
 )
@@ -28,6 +28,8 @@ import (
 // sorted batches directly.
 type BackfillManager struct {
 	sync.RWMutex `json:"-"`
+	BackfillConfig
+
 	// Name of the table.
 	TableName string `json:"-"`
 
@@ -35,7 +37,7 @@ type BackfillManager struct {
 	Shard int `json:"-"`
 
 	// queue to hold UpsertBatches to backfill
-	UpsertBatches []*UpsertBatch `json:"-"`
+	UpsertBatches []*memCom.UpsertBatch `json:"-"`
 
 	// keep track of the number of records in backfill queue
 	NumRecords int `json:"numRecords"`
@@ -45,12 +47,6 @@ type BackfillManager struct {
 
 	// keep track of the size of the buffer that holds batches being backfilled
 	BackfillingBufferSize int64 `json:"backfillingBufferSize"`
-
-	// max buffer size to hold backfill data
-	MaxBufferSize int64 `json:"maxBufferSize"`
-
-	// threshold to trigger archive
-	BackfillThresholdInBytes int64 `json:"backfillThresholdInBytes"`
 
 	// keep track of the redo log file of the last batch backfilled
 	LastRedoFile int64 `json:"lastRedoFile"`
@@ -67,13 +63,21 @@ type BackfillManager struct {
 	AppendCond *sync.Cond `json:"-"`
 }
 
+// BackfillConfig defines configs for backfill
+type BackfillConfig struct {
+	// max buffer size to hold backfill data
+	MaxBufferSize int64 `json:"maxBufferSize"`
+
+	// threshold to trigger backfill
+	BackfillThresholdInBytes int64 `json:"backfillThresholdInBytes"`
+}
+
 // NewBackfillManager creates a new BackfillManager instance.
-func NewBackfillManager(tableName string, shard int, tableConfig metaCom.TableConfig) *BackfillManager {
+func NewBackfillManager(tableName string, shard int, config BackfillConfig) *BackfillManager {
 	backfillManager := BackfillManager{
-		TableName:                tableName,
-		Shard:                    shard,
-		MaxBufferSize:            tableConfig.BackfillMaxBufferSize,
-		BackfillThresholdInBytes: tableConfig.BackfillThresholdInBytes,
+		TableName:      tableName,
+		Shard:          shard,
+		BackfillConfig: config,
 	}
 	backfillManager.AppendCond = sync.NewCond(&backfillManager.RWMutex)
 	return &backfillManager
@@ -94,7 +98,7 @@ func (r *BackfillManager) WaitForBackfillBufferAvailability() {
 
 // Append appends an upsert batch into the backfill queue.
 // Returns true if buffer limit has been reached and caller may need to wait
-func (r *BackfillManager) Append(upsertBatch *UpsertBatch, redoFile int64, batchOffset uint32) bool {
+func (r *BackfillManager) Append(upsertBatch *memCom.UpsertBatch, redoFile int64, batchOffset uint32) bool {
 	r.Lock()
 	defer r.Unlock()
 	r.CurrentRedoFile = redoFile
@@ -105,12 +109,12 @@ func (r *BackfillManager) Append(upsertBatch *UpsertBatch, redoFile int64, batch
 		return false
 	}
 
-	utils.GetLogger().Debugf("Table %s: Backfill batch of size %v, redoLog=%d offset=%d", r.TableName, len(upsertBatch.buffer)+upsertBatch.alternativeBytes,
+	utils.GetLogger().Debugf("Table %s: Backfill batch of size %v, redoLog=%d offset=%d", r.TableName, len(upsertBatch.GetBuffer())+upsertBatch.GetAlternativeBytes(),
 		redoFile, batchOffset)
 
 	r.UpsertBatches = append(r.UpsertBatches, upsertBatch)
 	r.NumRecords += upsertBatch.NumRows
-	r.CurrentBufferSize += (int64)(len(upsertBatch.buffer) + upsertBatch.alternativeBytes)
+	r.CurrentBufferSize += (int64)(len(upsertBatch.GetBuffer()) + upsertBatch.GetAlternativeBytes())
 	utils.GetReporter(r.TableName, r.Shard).GetGauge(utils.BackfillBufferFillRatio).Update(float64(r.CurrentBufferSize+r.BackfillingBufferSize) / float64(r.MaxBufferSize))
 	utils.GetReporter(r.TableName, r.Shard).GetGauge(utils.BackfillBufferSize).Update(float64(r.CurrentBufferSize + r.BackfillingBufferSize))
 	utils.GetReporter(r.TableName, r.Shard).GetGauge(utils.BackfillBufferNumRecords).Update(float64(r.NumRecords))
@@ -125,7 +129,7 @@ func (r *BackfillManager) Append(upsertBatch *UpsertBatch, redoFile int64, batch
 }
 
 // ReadUpsertBatch reads upsert batch in backfill queue, user should not lock schema
-func (r *BackfillManager) ReadUpsertBatch(index, start, length int, schema *TableSchema) (data [][]interface{}, columnNames []string, err error) {
+func (r *BackfillManager) ReadUpsertBatch(index, start, length int, schema *memCom.TableSchema) (data [][]interface{}, columnNames []string, err error) {
 	r.RLock()
 	defer r.RUnlock()
 
@@ -146,9 +150,13 @@ func (r *BackfillManager) ReadUpsertBatch(index, start, length int, schema *Tabl
 
 // StartBackfill gets a slice of UpsertBatches from backfill queue and returns the
 // CurrentRedoFile and CurrentBatchOffset.
-func (r *BackfillManager) StartBackfill() ([]*UpsertBatch, int64, uint32) {
+func (r *BackfillManager) StartBackfill() ([]*memCom.UpsertBatch, int64, uint32) {
 	r.Lock()
 	defer r.Unlock()
+
+	utils.GetLogger().With("action", "Backfill", "table", r.TableName, "shard", r.Shard,
+		"lastRedoFile", r.LastRedoFile, "lastOffset", r.LastBatchOffset, "newRedoFile", r.CurrentRedoFile,
+		"newOffset", r.CurrentBatchOffset).Info("Start backfill")
 
 	// no data to backfill
 	// but CurrentRedoFile/CurrentBatchOffset may not be checkpointed yet(live batch)
@@ -212,7 +220,7 @@ func (r *BackfillManager) Destruct() {
 
 // Done updates the backfill progress both in memory and in metastore.
 func (r *BackfillManager) Done(currentRedoFile int64, currentBatchOffset uint32,
-	metaStore metastore.MetaStore) error {
+	metaStore metaCom.MetaStore) error {
 	r.Lock()
 	defer r.Unlock()
 	if currentRedoFile > r.LastRedoFile ||
@@ -221,7 +229,11 @@ func (r *BackfillManager) Done(currentRedoFile int64, currentBatchOffset uint32,
 			currentBatchOffset); err != nil {
 			return err
 		}
+		utils.GetLogger().With("action", "Backfill", "table", r.TableName, "shard", r.Shard,
+			"lastRedoFile", r.LastRedoFile, "lastOffset", r.LastBatchOffset, "newRedoFile", currentRedoFile,
+			"newOffset", currentBatchOffset).Info("Finish backfill")
 		r.advanceOffset(currentRedoFile, currentBatchOffset)
 	}
+
 	return nil
 }

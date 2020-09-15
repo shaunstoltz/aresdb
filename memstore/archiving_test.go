@@ -24,13 +24,16 @@ import (
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
+	"github.com/uber/aresdb/common"
 	memCom "github.com/uber/aresdb/memstore/common"
+	"github.com/uber/aresdb/memstore/list"
 	metaCom "github.com/uber/aresdb/metastore/common"
+	"github.com/uber/aresdb/redolog"
 	"github.com/uber/aresdb/utils"
 )
 
 var _ = ginkgo.Describe("archiving", func() {
-	var batch99, batch101, batch110 *Batch
+	var batch99, batch101, batch110 *memCom.Batch
 	var archiveBatch0 *ArchiveBatch
 	var vs LiveStore
 	//var dataTypes []memCom.DataType
@@ -45,14 +48,16 @@ var _ = ginkgo.Describe("archiving", func() {
 	key := getIdentifier(table, shardID, memCom.ArchivingJobType)
 	day := 0
 
-	m = getFactory().NewMockMemStore()
+	m = GetFactory().NewMockMemStore()
 	hostMemoryManager := NewHostMemoryManager(m, 1<<32)
-	shard := NewTableShard(&TableSchema{
+	shard := NewTableShard(&memCom.TableSchema{
 		Schema: metaCom.Table{
 			Name: table,
 			Config: metaCom.TableConfig{
 				ArchivingDelayMinutes:    500,
 				ArchivingIntervalMinutes: 300,
+				RedoLogRotationInterval:  10800,
+				MaxRedoLogFileSize:       1 << 30,
 			},
 			IsFactTable:          true,
 			ArchivingSortColumns: []int{1, 2},
@@ -60,11 +65,12 @@ var _ = ginkgo.Describe("archiving", func() {
 				{Deleted: false},
 				{Deleted: false},
 				{Deleted: false},
+				{Deleted: false},
 			},
 		},
-		ValueTypeByColumn: []memCom.DataType{memCom.Uint32, memCom.Bool, memCom.Float32},
-		DefaultValues:     []*memCom.DataValue{&memCom.NullDataValue, &memCom.NullDataValue, &memCom.NullDataValue},
-	}, nil, nil, hostMemoryManager, shardID)
+		ValueTypeByColumn: []memCom.DataType{memCom.Uint32, memCom.Bool, memCom.Float32, memCom.ArrayInt16},
+		DefaultValues:     []*memCom.DataValue{&memCom.NullDataValue, &memCom.NullDataValue, &memCom.NullDataValue, &memCom.NullDataValue},
+	}, nil, nil, hostMemoryManager, shardID, 1, m.options)
 
 	shard.ArchiveStore = &ArchiveStore{CurrentVersion: &ArchiveStoreVersion{
 		ArchivingCutoff: 0,
@@ -78,13 +84,13 @@ var _ = ginkgo.Describe("archiving", func() {
 	ginkgo.BeforeEach(func() {
 		//dataTypes = []memCom.DataType{memCom.Uint32, memCom.Bool, memCom.Float32}
 		var err error
-		batch110, err = getFactory().ReadLiveBatch("archiving/batch-110")
+		batch110, err = GetFactory().ReadLiveBatch("archiving/batch-110")
 		Ω(err).Should(BeNil())
-		batch101, err = getFactory().ReadLiveBatch("archiving/batch-101")
+		batch101, err = GetFactory().ReadLiveBatch("archiving/batch-101")
 		Ω(err).Should(BeNil())
-		batch99, err = getFactory().ReadLiveBatch("archiving/batch-99")
+		batch99, err = GetFactory().ReadLiveBatch("archiving/batch-99")
 		Ω(err).Should(BeNil())
-		tmpBatch, err := getFactory().ReadArchiveBatch("archiving/archiveBatch0")
+		tmpBatch, err := GetFactory().ReadArchiveBatch("archiving/archiveBatch0")
 		Ω(err).Should(BeNil())
 		archiveBatch0 = &ArchiveBatch{
 			Version: 0,
@@ -93,7 +99,7 @@ var _ = ginkgo.Describe("archiving", func() {
 			Batch:   *tmpBatch,
 		}
 		vs = LiveStore{
-			LastReadRecord: RecordID{-101, 3},
+			LastReadRecord: memCom.RecordID{BatchID: -101, Index: 3},
 			Batches: map[int32]*LiveBatch{
 				-110: {
 					Batch:     *batch110,
@@ -116,6 +122,8 @@ var _ = ginkgo.Describe("archiving", func() {
 			HostMemoryManager: hostMemoryManager,
 		}
 
+		redoLogManagerMaster, _ := redolog.NewRedoLogManagerMaster("", &common.RedoLogConfig{}, m.diskStore, m.metaStore)
+
 		shardMap[shardID].diskStore = m.diskStore
 		shardMap[shardID].metaStore = m.metaStore
 		shardMap[shardID].LiveStore = &vs
@@ -123,12 +131,12 @@ var _ = ginkgo.Describe("archiving", func() {
 		shardMap[shardID].ArchiveStore.CurrentVersion.shard = shardMap[shardID]
 		shardMap[shardID].ArchiveStore.CurrentVersion.Batches[0] = archiveBatch0
 		// Map from max event time to file creation time.
-		shardMap[shardID].LiveStore.RedoLogManager = NewRedoLogManager(10800, 1<<30, m.diskStore, table, shardID)
-		shardMap[shardID].LiveStore.RedoLogManager.MaxEventTimePerFile = make(map[int64]uint32)
-		shardMap[shardID].LiveStore.RedoLogManager.MaxEventTimePerFile[1] = 1
+		shardMap[shardID].LiveStore.RedoLogManager, err = redoLogManagerMaster.NewRedologManager(table, shardID, false, &shard.Schema.Schema.Config)
+		shardMap[shardID].LiveStore.RedoLogManager.UpdateMaxEventTime(1, 1)
+
 		// make purge to pass
-		shardMap[shardID].LiveStore.BackfillManager = NewBackfillManager(table, shardID, metaCom.TableConfig{
-			BackfillMaxBufferSize:    1 << 32,
+		shardMap[shardID].LiveStore.BackfillManager = NewBackfillManager(table, shardID, BackfillConfig{
+			MaxBufferSize:            1 << 32,
 			BackfillThresholdInBytes: 1 << 21,
 		})
 		shardMap[shardID].LiveStore.BackfillManager.LastRedoFile = 2
@@ -165,14 +173,14 @@ var _ = ginkgo.Describe("archiving", func() {
 			[]int{1, 2},
 		))
 		Ω(patchByDay[0].recordIDs).Should(Equal(
-			[]RecordID{
-				{0, 1},
-				{0, 2},
-				{0, 3},
-				{0, 4},
-				{1, 0},
-				{1, 1},
-				{1, 2},
+			[]memCom.RecordID{
+				{BatchID: 0, Index: 1},
+				{BatchID: 0, Index: 2},
+				{BatchID: 0, Index: 3},
+				{BatchID: 0, Index: 4},
+				{BatchID: 1, Index: 0},
+				{BatchID: 1, Index: 1},
+				{BatchID: 1, Index: 2},
 			},
 		))
 		scheduler.RLock()
@@ -192,14 +200,14 @@ var _ = ginkgo.Describe("archiving", func() {
 		patchByDay := ss.createArchivingPatches(cutoff, oldCutoff, []int{1, 2}, jobManager.reportArchiveJobDetail, key, table, shardID)
 		sort.Sort(patchByDay[0])
 		Ω(patchByDay[0].recordIDs).Should(Equal(
-			[]RecordID{
-				{0, 3}, // null, 1.2
-				{1, 0}, // false, null
-				{0, 1}, // false, 1.0
-				{1, 2}, // false, 1.2
-				{0, 4}, // false, 1.3
-				{0, 2}, // true, null
-				{1, 1}, // true, 1.1
+			[]memCom.RecordID{
+				{BatchID: 0, Index: 3}, // null, 1.2
+				{BatchID: 1, Index: 0}, // false, null
+				{BatchID: 0, Index: 1}, // false, 1.0
+				{BatchID: 1, Index: 2}, // false, 1.2
+				{BatchID: 0, Index: 4}, // false, 1.3
+				{BatchID: 0, Index: 2}, // true, null
+				{BatchID: 1, Index: 1}, // true, 1.1
 			},
 		))
 		Ω(patchByDay[0].sortColumns).Should(Equal(
@@ -221,14 +229,16 @@ var _ = ginkgo.Describe("archiving", func() {
 		(m.diskStore).(*diskMocks.DiskStore).On(
 			"DeleteLogFile", table, shardID, int64(1)).Return(nil)
 
-		writer := new(utilsMocks.WriteCloser)
+		writer := new(utilsMocks.WriteSyncCloser)
 		writer.On("Write", mock.Anything).Return(0, nil)
 		writer.On("Close").Return(nil)
+		writer.On("Sync").Return(nil)
 
 		(m.diskStore).(*diskMocks.DiskStore).On(
 			"OpenVectorPartyFileForWrite", table, mock.Anything, shardID, day, mock.Anything, mock.Anything).Return(writer, nil)
 
-		tableShard.LiveStore.RedoLogManager.CurrentFileCreationTime = 2
+		redologManager := tableShard.LiveStore.RedoLogManager.(*redolog.FileRedoLogManager)
+		redologManager.CurrentFileCreationTime = 2
 
 		timeIncrementer := &utils.TimeIncrementer{IncBySecond: 1}
 		utils.SetClockImplementation(timeIncrementer.Now)
@@ -255,27 +265,43 @@ var _ = ginkgo.Describe("archiving", func() {
 		Ω(tableShard.ArchiveStore.CurrentVersion.Batches).Should(HaveKey(int32(0)))
 		mergedBatch := tableShard.ArchiveStore.CurrentVersion.Batches[0]
 		Ω(mergedBatch.Size).Should(BeEquivalentTo(12))
-		Ω(mergedBatch.Columns).Should(HaveLen(3))
+		Ω(mergedBatch.Columns).Should(HaveLen(4))
 
 		timeColumn := mergedBatch.Columns[0]
 		Ω(timeColumn.GetLength()).Should(BeEquivalentTo(12))
 		Ω(timeColumn.(memCom.CVectorParty).GetMode()).Should(BeEquivalentTo(memCom.AllValuesPresent))
 
 		// Old version of archiving store should be purged.
-		for _, column := range archiveBatch0.Columns {
-			Ω(column.(*archiveVectorParty).values).Should(BeNil())
-			Ω(column.(*archiveVectorParty).nulls).Should(BeNil())
-			Ω(column.(*archiveVectorParty).counts).Should(BeNil())
+		for i, column := range archiveBatch0.Columns {
+			if i != 3 && i != 4 {
+				Ω(column.(*archiveVectorParty).values).Should(BeNil())
+				Ω(column.(*archiveVectorParty).nulls).Should(BeNil())
+				Ω(column.(*archiveVectorParty).counts).Should(BeNil())
+			} else {
+				Ω(column.(*list.ArchiveVectorParty).GetBytes()).Should(Equal(int64(0)))
+			}
 		}
 
 		// If a batch is partially read, it should not be purged
-		for _, column := range batch101.Columns {
-			Ω(column.(*cLiveVectorParty).GetMode()).ShouldNot(BeEquivalentTo(memCom.AllValuesDefault))
-			Ω(column.(*cLiveVectorParty).values).ShouldNot(BeNil())
+		for i, column := range batch101.Columns {
+			if i != 3 && i != 4 {
+				Ω(column.(*cLiveVectorParty).GetMode()).ShouldNot(BeEquivalentTo(memCom.AllValuesDefault))
+				Ω(column.(*cLiveVectorParty).values).ShouldNot(BeNil())
+			} else {
+				Ω(column.(*list.LiveVectorParty).GetBytes()).ShouldNot(Equal(int64(0)))
+			}
 		}
 
+		// array value validation
+		arrayColumn := mergedBatch.Columns[3]
+		Ω(arrayColumn.GetLength()).Should(BeEquivalentTo(12))
+		val, valid := arrayColumn.AsList().GetListValue(11)
+		Ω(valid).Should(BeTrue())
+		reader := memCom.NewArrayValueReader(memCom.ArrayInt16, val)
+		Ω(*(*uint16)(reader.Get(0))).Should(Equal(uint16(21)))
+
 		// MaxEventTimePerFile should be purged.
-		Ω(tableShard.LiveStore.RedoLogManager.MaxEventTimePerFile).ShouldNot(HaveKey(int64(1)))
+		Ω(redologManager.MaxEventTimePerFile).ShouldNot(HaveKey(int64(1)))
 
 		// Archive again, there should be no crashes or errors.
 		Ω(m.Archive(table, shardID, cutoff+100, jobManager.reportArchiveJobDetail)).Should(BeNil())
@@ -287,7 +313,7 @@ var _ = ginkgo.Describe("archiving", func() {
 		shardID := 0
 		key := getIdentifier(table, shardID, memCom.ArchivingJobType)
 		liveStore := &LiveStore{}
-		batch120, err := getFactory().ReadLiveBatch("archiving/batch-120")
+		batch120, err := GetFactory().ReadLiveBatch("archiving/batch-120")
 		Ω(err).Should(BeNil())
 		liveStore.Batches = map[int32]*LiveBatch{
 			-120: {
@@ -317,28 +343,28 @@ var _ = ginkgo.Describe("archiving", func() {
 		})
 
 		Ω(patchByDay[0].recordIDs).Should(Or(Equal(
-			[]RecordID{
-				{0, 1},
-				{0, 2},
-				{1, 1},
-				{1, 2},
-				{1, 3},
-				{1, 4},
+			[]memCom.RecordID{
+				{BatchID: 0, Index: 1},
+				{BatchID: 0, Index: 2},
+				{BatchID: 1, Index: 1},
+				{BatchID: 1, Index: 2},
+				{BatchID: 1, Index: 3},
+				{BatchID: 1, Index: 4},
 			}), Equal(
-			[]RecordID{
-				{0, 1},
-				{0, 2},
-				{0, 3},
-				{0, 4},
-				{1, 1},
-				{1, 2},
+			[]memCom.RecordID{
+				{BatchID: 0, Index: 1},
+				{BatchID: 0, Index: 2},
+				{BatchID: 0, Index: 3},
+				{BatchID: 0, Index: 4},
+				{BatchID: 1, Index: 1},
+				{BatchID: 1, Index: 2},
 			}),
 		))
 	})
 
 	ginkgo.It("purge live batch with missing event time", func() {
 		liveStore := &LiveStore{
-			tableSchema: &TableSchema{
+			tableSchema: &memCom.TableSchema{
 				Schema: metaCom.Table{
 					Config: metaCom.TableConfig{
 						AllowMissingEventTime: true,
@@ -346,7 +372,7 @@ var _ = ginkgo.Describe("archiving", func() {
 				},
 			},
 		}
-		batch120, err := getFactory().ReadLiveBatch("archiving/batch-120")
+		batch120, err := GetFactory().ReadLiveBatch("archiving/batch-120")
 		Ω(err).Should(BeNil())
 
 		// all event time are old

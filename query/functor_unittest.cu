@@ -728,7 +728,7 @@ TEST(BinaryFunctorTest, CheckBinaryFunctor) {
 
   // Test BitwiseAndFunctor
   thrust::transform(begin1, begin1 + 5, begin2, outputBegin,
-                    BinaryFunctor<int, int>(BitwiseAnd));
+                    BinaryFunctor<int, int, int>(BitwiseAnd));
 
   int expectedValues[5] = {0, 0x00, 0x0F, 0x00, 0x00};
   bool expectedNulls[5] = {false, true, true, true, true};
@@ -771,7 +771,7 @@ TEST(BinaryPredicateFunctorTest, CheckBinaryTranformFunctor) {
 
   // Test BitwiseAndFunctor
   thrust::transform(begin1, begin1 + 5, begin2, &outputValues[0],
-                    BinaryPredicateFunctor<bool, int>(And));
+                    BinaryPredicateFunctor<bool, int, int>(And));
 
   bool expectedValues[5] = {0, 1, 1, 0, 1};
   EXPECT_TRUE(
@@ -1166,6 +1166,133 @@ TEST(CalculateHLLHashTest, CheckUUIDT) {
                             std::begin(expectedValues)));
   EXPECT_TRUE(thrust::equal(std::begin(outputNulls), std::end(outputNulls),
                             std::begin(expectedNulls)));
+}
+
+TEST(ArrayLengthTest, CheckArrayLengthFunctor) {
+  uint32_t offsetLength[12] = {0, 2, 16, 1, 32, 3, 0, 0, 0xFFFFFFFF, 0, 56, 1};
+  uint32_t values[72] = {2, 1, 2, 0x03,
+                         1, 1, 0x01, 0,
+                         3, 1, 2, 3, 0x07, 0,
+                         1, 1, 0x01, 0};
+
+  uint32_t expectedVals[6] = {2, 1, 3, 0, 0, 1};
+  bool expectedNulls[6] = {true, true, true, false, true, true};
+#ifdef RUN_ON_DEVICE
+  cudaStream_t s = NULL;
+  int device = 0;
+  cudaStreamCreate(&s);
+  cudaSetDevice(device);
+#endif
+  uint8_t *basePtr = allocate_array_column(
+        reinterpret_cast<uint8_t *>(&offsetLength[0]),
+        reinterpret_cast<uint8_t *>(&values[0]), 6, 72*4);
+
+  ArrayVectorPartyIterator<uint32_t> begin =
+            make_array_column_iterator<uint32_t>(basePtr, 0, 6);
+
+  auto outputValues = allocate_raw(8+6*4);
+  auto outputBegin = make_zip_iterator(
+        thrust::make_tuple(reinterpret_cast<uint32_t *>(outputValues+8),
+                           reinterpret_cast<bool *>(outputValues)));
+
+  thrust::transform(GET_EXECUTION_POLICY(s), begin, begin + 6, outputBegin,
+                    UnaryFunctor<uint32_t, uint32_t*>(ArrayLength));
+  EXPECT_TRUE(
+      equal(reinterpret_cast<uint32_t*>(outputValues+8),
+            reinterpret_cast<uint32_t*>(outputValues+8)+6,
+                    expectedVals));
+  EXPECT_TRUE(
+      equal(reinterpret_cast<bool*>(outputValues),
+            reinterpret_cast<bool*>(outputValues)+6,
+                    expectedNulls));
+  release(basePtr);
+  release(outputValues);
+}
+
+TEST(ArrayContainsTest, CheckArrayContainsFunctor) {
+  uint32_t offsetLength[12] = {0, 2, 16, 1, 32, 3, 0, 0, 0xFFFFFFFF, 0, 56, 1};
+  uint32_t values[72] = {2, 1, 2, 0x03,
+                         1, 1, 0x01, 0,
+                         3, 1, 2, 3, 0x07, 0,
+                         1, 1, 0x01, 0};
+  bool expectedValues[6] = {true, false, true, false, false, false};
+#ifdef RUN_ON_DEVICE
+  cudaStream_t s = NULL;
+  int device = 0;
+  cudaStreamCreate(&s);
+  cudaSetDevice(device);
+#endif
+  uint8_t *basePtr = allocate_array_column(
+        reinterpret_cast<uint8_t *>(&offsetLength[0]),
+        reinterpret_cast<uint8_t *>(&values[0]), 6, 72*4);
+
+  ArrayVectorPartyIterator<uint32_t> begin =
+            make_array_column_iterator<uint32_t>(basePtr, 0, 6);
+
+  auto begin2 = thrust::make_constant_iterator(
+        thrust::make_tuple<uint32_t, bool>(2, true));
+
+  auto outputValues = allocate_raw(16);
+  auto outputBegin = make_zip_iterator(
+        thrust::make_tuple(reinterpret_cast<bool *>(outputValues+8),
+                           reinterpret_cast<bool *>(outputValues)));
+
+  // Test BitwiseAndFunctor
+  thrust::transform(GET_EXECUTION_POLICY(s), begin, begin + 6, begin2,
+         outputBegin, BinaryFunctor<bool, uint32_t*, uint32_t>(ArrayContains));
+
+  EXPECT_TRUE(
+      equal_print(reinterpret_cast<bool *>(outputValues+8),
+                  reinterpret_cast<bool *>(outputValues+8)+6,
+                 expectedValues));
+  release(basePtr);
+  release(outputValues);
+}
+
+TEST(ArrayElementAtTest, CheckArrayElementAtFunctor) {
+  uint32_t offsetLength[12] = {0, 2, 16, 1, 32, 3, 0, 0, 0xFFFFFFFF, 0, 56, 1};
+  uint32_t values[72] = {2, 1, 2, 0x03,
+                         1, 1, 0x01, 0,
+                         3, 1, 2, 3, 0x07, 0,
+                         1, 1, 0x01, 0};
+
+  uint32_t expectedValues[6] = {2, 0, 2, 0, 0, 0};
+  bool expectedNulls[6] = {true, false, true, false, false, false};
+
+#ifdef RUN_ON_DEVICE
+  cudaStream_t s = NULL;
+  int device = 0;
+  cudaStreamCreate(&s);
+  cudaSetDevice(device);
+#endif
+  uint8_t *basePtr = allocate_array_column(
+        reinterpret_cast<uint8_t *>(&offsetLength[0]),
+        reinterpret_cast<uint8_t *>(&values[0]), 6, 72*4);
+
+  ArrayVectorPartyIterator<uint32_t> begin =
+            make_array_column_iterator<uint32_t>(basePtr, 0, 6);
+
+  auto begin2 = thrust::make_constant_iterator(
+                thrust::make_tuple<int, bool>(1, true));
+  auto outputValues = allocate_raw(8+6*4);
+  auto outputBegin = make_zip_iterator(
+        thrust::make_tuple(reinterpret_cast<uint32_t *>(outputValues+8),
+                           reinterpret_cast<bool *>(outputValues)));
+
+  // Test BitwiseAndFunctor
+  thrust::transform(GET_EXECUTION_POLICY(s), begin, begin + 6, begin2,
+        outputBegin, BinaryFunctor<uint32_t, uint32_t*, int>(ArrayElementAt));
+
+  EXPECT_TRUE(
+      equal(reinterpret_cast<uint32_t *>(outputValues+8),
+             reinterpret_cast<uint32_t *>(outputValues+8) + 6,
+             expectedValues));
+  EXPECT_TRUE(
+      equal(reinterpret_cast<bool *>(outputValues),
+            reinterpret_cast<bool *>(outputValues+6),
+            expectedNulls));
+  release(basePtr);
+  release(outputValues);
 }
 
 }  // namespace ares

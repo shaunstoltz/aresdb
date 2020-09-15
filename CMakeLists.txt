@@ -31,12 +31,40 @@ if (NOT QUERY_MODE)
     endif ()
 endif ()
 
+if(NOT WIN32)
+  string(ASCII 27 Esc)
+  set(ColourReset "${Esc}[m")
+  set(ColourBold  "${Esc}[1m")
+  set(Red         "${Esc}[31m")
+  set(Green       "${Esc}[32m")
+  set(Yellow      "${Esc}[33m")
+  set(Blue        "${Esc}[34m")
+  set(Magenta     "${Esc}[35m")
+  set(Cyan        "${Esc}[36m")
+  set(White       "${Esc}[37m")
+  set(BoldRed     "${Esc}[1;31m")
+  set(BoldGreen   "${Esc}[1;32m")
+  set(BoldYellow  "${Esc}[1;33m")
+  set(BoldBlue    "${Esc}[1;34m")
+  set(BoldMagenta "${Esc}[1;35m")
+  set(BoldCyan    "${Esc}[1;36m")
+  set(BoldWhite   "${Esc}[1;37m")
+endif()
+
 ################################
 # Compiler and linker flags
 ################################
-set(CMAKE_CUDA_STANDARD 11)
+# Explicitly set the CXX_STANDARD instead of detecting from
+# CMAKE_CXX_FEATURES since NVCC has its own way to check whether
+# host compiler supports specific CXX_STANDARD.
+if (NOT DEFINED CXX_STANDARD)
+    set(CXX_STANDARD 11)
+endif ()
+
+set(CMAKE_CUDA_STANDARD ${CXX_STANDARD})
+set(CMAKE_CXX_STANDARD ${CXX_STANDARD})
+
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(${PROJECT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/include)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY lib)
@@ -45,11 +73,18 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
 set(CMAKE_C_FLAGS -fPIC)
 set(CMAKE_SHARED_LIBRARY_SUFFIX_C .so)
 set(CMAKE_SHARED_LIBRARY_SUFFIX_CXX .so)
-set(CMAKE_CUDA_FLAGS "-lineinfo -I. $ENV{NVCCFLAGS} ${CMAKE_CUDA_FLAGS}")
+set(CMAKE_CUDA_FLAGS " -lineinfo -I. $ENV{NVCCFLAGS} ${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr")
 set(GENCODE_FLAGS "-gencode arch=compute_60,code=sm_60 -gencode arch=compute_60,code=compute_60")
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 link_directories(${CMAKE_BINARY_DIR}/lib)
+
+# HASH_REDUCTION right now is only support in device mode and when CXX standard is C++14.
+if ((NOT QUERY_MODE STREQUAL "DEVICE") OR (${CXX_STANDARD} EQUAL 14))
+    list(APPEND MARCROS "SUPPORT_HASH_REDUCTION=1")
+    set(SUPPORT_HASH_REDUCTION 1)
+    message("${Green}Hash reduction is supported${ColourReset}!")
+endif ()
 
 ################################
 # GTest
@@ -84,22 +119,41 @@ if (QUERY_MODE STREQUAL "DEVICE" AND USE_RMM)
     add_library(rmm SHARED IMPORTED)
     set_target_properties(rmm PROPERTIES IMPORTED_LOCATION ${CMAKE_BINARY_DIR}/lib/librmm.so)
     add_dependencies(rmm project_rmm)
+    include_directories(
+            ${RMM_SRC_DIR}/include
+            ${RMM_SRC_DIR}/thirdparty/cnmem/include
+    )
+endif ()
+######################################################
+# CUDF
+# Need cpp/src/hash/concurrent_unordered_map.cuh only
+######################################################
+if (SUPPORT_HASH_REDUCTION)
+    set(CUDF_PROJECT_DIR ${CMAKE_CURRENT_LIST_DIR}/thirdparty/cudf)
+    include_directories(
+            ${CUDF_PROJECT_DIR}/cpp/src
+            ${CUDF_PROJECT_DIR}/cpp/include
+            ${CUDF_PROJECT_DIR}/thirdparty/cub
+            # cudf need to find rmm/thrust_rmm_allocator.h even it's not actually linking
+            # TODO(lucafuji) remove this include directory after RMM is default memory management system
+            ${RMM_SRC_DIR}/include
+            ${RMM_SRC_DIR}/thirdparty/cnmem/include
+    )
 endif ()
 ################################
 # Mem
 ################################
-
 if (QUERY_MODE STREQUAL "DEVICE")
     list(APPEND MARCROS "RUN_ON_DEVICE=1")
     if (USE_RMM)
         list(APPEND MARCROS "USE_RMM=1")
-        add_library(mem SHARED memutils/memory.h memutils/memory/rmm_alloc.cu)
+        add_library(mem SHARED cgoutils/memory.h cgoutils/memory/rmm_alloc.cu)
         target_link_libraries(mem rmm)
     else ()
-        add_library(mem SHARED memutils/memory.h memutils/memory/cuda_malloc.cu)
+        add_library(mem SHARED cgoutils/memory.h cgoutils/memory/cuda_malloc.cu)
     endif ()
 else ()
-    add_library(mem SHARED memutils/memory.h memutils/memory/malloc.c)
+    add_library(mem SHARED cgoutils/memory.h cgoutils/memory/malloc.c)
 endif ()
 ################################
 # Algorithm
@@ -130,24 +184,23 @@ add_library(algorithm SHARED
         query/functor.cu
         query/geo_intersects.cu
         query/hash_lookup.cu
+        query/hash_reduction.cu
         query/hll.cu
+        query/concurrent_unordered_map.hpp
         query/iterator.hpp
+        query/iterator.cu
         query/memory.cu
         query/memory.hpp
         query/measure_transform.cu
         query/scratch_space_transform.cu
         query/sort_reduce.cu
-        query/thrust_rmm_allocator.hpp
+        query/time_series_aggregate.h
         query/transform.cu
         query/transform.hpp
         query/utils.cu
         query/utils.hpp)
 
 target_link_libraries(algorithm mem)
-################################
-# rdkafka 
-################################
-include(rdkafka.cmake)
 ################################
 # Unit Tests
 ################################
@@ -207,24 +260,27 @@ add_custom_target(lint
         COMMAND ./scripts/golang-lint.sh ${CHANGED_GO_SRC}
         VERBATIM)
 
-add_custom_target(golang-dep DEPENDS vendor/glide.updated)
-add_custom_command(
-        OUTPUT vendor/glide.updated
-        COMMAND glide install && touch vendor/glide.updated
-        DEPENDS glide.lock glide.yaml
-        VERBATIM
-)
-
 add_custom_target(lib DEPENDS algorithm mem)
 
 string(REPLACE " " ";" ALL_GO_SRC_LIST ${ALL_GO_SRC})
-add_custom_target(aresd DEPENDS golang-dep lib ${ALL_GO_SRC_LIST}
+
+add_custom_target(aresd DEPENDS lib ${ALL_GO_SRC_LIST}
         COMMAND go build -o bin/aresd ./cmd/aresd/main.go
         VERBATIM
         )
 
-add_custom_target(ares-subscriber DEPENDS golang-dep rdkafka::rdkafka ${ALL_GO_SRC_LIST}
+add_custom_target(aresbrokerd DEPENDS ${ALL_GO_SRC_LIST}
+        COMMAND go build -o bin/aresbrokerd ./cmd/broker/main.go
+        VERBATIM 
+        )
+
+add_custom_target(ares-subscriber DEPENDS ${ALL_GO_SRC_LIST}
         COMMAND go build -tags static -o bin/ares-subscriber ./cmd/subscriber/main.go
+        VERBATIM
+        )
+
+add_custom_target(arescontrollerd DEPENDS ${ALL_GO_SRC_LIST}
+        COMMAND go build -o bin/arescontrollerd ./cmd/controller/main.go
         VERBATIM
         )
 
@@ -232,7 +288,7 @@ add_custom_target(run_server DEPENDS aresd
         COMMAND bash -c 'DYLD_LIBRARY_PATH=$$LIBRARY_PATH ./bin/aresd'
         )
 
-add_custom_target(test-golang DEPENDS aresd rdkafka::rdkafka
+add_custom_target(test-golang
         COMMAND bash -c 'ARES_ENV=test DYLD_LIBRARY_PATH=$$LIBRARY_PATH ginkgo -r'
         )
 
@@ -240,7 +296,7 @@ add_custom_target(test-golang DEPENDS aresd rdkafka::rdkafka
 # misc
 ###############################
 
-add_custom_target(travis DEPENDS rdkafka::rdkafka
+add_custom_target(travis
         COMMAND bash -c 'ARES_ENV=test .travis/run_unittest.sh'
         )
 
@@ -266,7 +322,8 @@ set(ANTLR_BIN "${CMAKE_SOURCE_DIR}/.bin/antlr-4.7.1-complete.jar")
 set(ANTLR_URL "http://www.antlr.org/download/antlr-4.7.1-complete.jar")
 add_custom_target(antlr DEPENDS ANTLR_BIN
         COMMAND java -jar ${ANTLR_BIN} -Dlanguage=Go -package antlrgen -Xexact-output-dir -o query/sql/antlrgen -visitor -no-listener query/sql/SqlBase.g4
-)
+        )
+
 add_custom_command(
         OUTPUT ANTLR_BIN
         COMMAND mkdir -p .bin && curl -L -o ${ANTLR_BIN} ${ANTLR_URL}

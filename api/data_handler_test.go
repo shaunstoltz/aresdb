@@ -21,7 +21,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 
-	"github.com/uber/aresdb/memstore"
 	memCom "github.com/uber/aresdb/memstore/common"
 	memMocks "github.com/uber/aresdb/memstore/mocks"
 	metaCom "github.com/uber/aresdb/metastore/common"
@@ -34,7 +33,7 @@ import (
 
 var _ = ginkgo.Describe("DataHandler", func() {
 	var testServer *httptest.Server
-	var testSchema = memstore.NewTableSchema(&metaCom.Table{
+	var testSchema = memCom.NewTableSchema(&metaCom.Table{
 		Name:        "abc",
 		IsFactTable: false,
 		Config: metaCom.TableConfig{
@@ -46,7 +45,7 @@ var _ = ginkgo.Describe("DataHandler", func() {
 	ginkgo.BeforeEach(func() {
 		memStore = CreateMemStore(testSchema, 0, nil, CreateMockDiskStore())
 		memStore.On("HandleIngestion", "abc", 0, mock.Anything).Return(nil)
-		dataHandler := NewDataHandler(memStore)
+		dataHandler := NewDataHandler(memStore, 10)
 		testRouter := mux.NewRouter()
 		dataHandler.Register(testRouter.PathPrefix("/data").Subrouter())
 

@@ -76,12 +76,12 @@ var _ = ginkgo.Describe("snapshot", func() {
 	diskStore := &diskMocks.DiskStore{}
 	metaStore := &metaMocks.MetaStore{}
 
-	diskStore.On("OpenLogFileForAppend", mock.Anything, mock.Anything, mock.Anything).Return(&testing.TestReadWriteCloser{}, nil)
+	diskStore.On("OpenLogFileForAppend", mock.Anything, mock.Anything, mock.Anything).Return(&testing.TestReadWriteSyncCloser{}, nil)
 
 	lastBatchID := int32(math.MinInt32 + 1)
 	lastIndex := uint32(5)
 
-	currentRecord := RecordID{
+	currentRecord := memCom.RecordID{
 		BatchID: lastBatchID,
 		Index:   lastIndex,
 	}
@@ -101,7 +101,7 @@ var _ = ginkgo.Describe("snapshot", func() {
 			builder.SetValue(i, 2, "A424DBC38B0543F9A3A42CF0FC310A39")
 		}
 		buffer, _ := builder.ToByteArray()
-		upsertBatch, _ := NewUpsertBatch(buffer)
+		upsertBatch, _ := memCom.NewUpsertBatch(buffer)
 		return memStore.HandleIngestion(tableName, 0, upsertBatch)
 	}
 
@@ -159,9 +159,10 @@ var _ = ginkgo.Describe("snapshot", func() {
 		shard.LiveStore.SnapshotManager.LastRedoFile = 0
 		shard.LiveStore.SnapshotManager.ApplyUpsertBatch(redoLogFile+10, offset, 10, currentRecord)
 
-		writer := new(utilsMocks.WriteCloser)
+		writer := new(utilsMocks.WriteSyncCloser)
 		writer.On("Write", mock.Anything).Return(0, nil)
 		writer.On("Close").Return(nil)
+		writer.On("Sync").Return(nil)
 
 		diskStore.On(
 			"OpenSnapshotVectorPartyFileForWrite", tableName, 0, redoLogFile+10, offset, mock.Anything, mock.Anything).
@@ -199,7 +200,7 @@ var _ = ginkgo.Describe("snapshot", func() {
 			[]int{0}, batchSize, false, false, metaStore, diskStore)
 		shard, _ = memStore.GetTableShard(tableName, 0)
 
-		shard.LiveStore.SnapshotManager.ApplyUpsertBatch(0, 0, 0, RecordID{})
+		shard.LiveStore.SnapshotManager.ApplyUpsertBatch(0, 0, 0, memCom.RecordID{})
 		shard.LiveStore.SnapshotManager.SetLastSnapshotInfo(redoLogFile, offset, currentRecord)
 
 		batchIDs := []int{int(lastBatchID - 1), int(lastBatchID)}
@@ -236,12 +237,15 @@ var _ = ginkgo.Describe("snapshot", func() {
 
 		// check if the primray key rebuilt and can data be found
 		primaryKeyBytes := shard.Schema.PrimaryKeyBytes
-		var key []byte
+		key := make([]byte, primaryKeyBytes)
 		primaryKeyValues := make([]memCom.DataValue, 1)
 
 		for row := 0; row <= rows; row++ {
 			primaryKeyValues[0], _ = memCom.ValueFromString(fmt.Sprintf("%d", row+1), memCom.Uint16)
-			key, err = GetPrimaryKeyBytes(primaryKeyValues, primaryKeyBytes)
+			// truncate key
+			key = key[:0]
+			// write primary key bytes
+			key, err = memCom.AppendPrimaryKeyBytes(key, memCom.NewSliceDataValueIterator(primaryKeyValues))
 
 			Ω(err).Should(BeNil())
 			record, found := shard.LiveStore.PrimaryKey.Find(key)
@@ -255,18 +259,12 @@ var _ = ginkgo.Describe("snapshot", func() {
 		}
 	})
 
-	ginkgo.It("dimension table snapshot failure", func() {
+	ginkgo.It("dimension table snapshot on deleted table should not return error", func() {
 		snapshotJobM := &snapshotJobManager{
 			jobDetails: make(map[string]*SnapshotJobDetail),
 			memStore:   memStore,
 		}
-		err := memStore.Snapshot("testTable", 0, snapshotJobM.reportSnapshotJobDetail)
-		Ω(err).ShouldNot(BeNil())
-
-		diskStore.On(
-			"OpenSnapshotVectorPartyFileForWrite", mock.Anything, 1, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(nil, fmt.Errorf("intended error"))
-		err = memStore.Snapshot("testTable", 0, snapshotJobM.reportSnapshotJobDetail)
-		Ω(err).ShouldNot(BeNil())
+		err := memStore.Snapshot("NonExistTable", 0, snapshotJobM.reportSnapshotJobDetail)
+		Ω(err).Should(BeNil())
 	})
 })

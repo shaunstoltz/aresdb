@@ -8,26 +8,42 @@ query:
   # enable timezone column for queries with "timezone": "timezone(city_id)"
   timezone_table:
     table_name: api_cities
+  enable_hash_reduction: false
+
 disk_store:
   write_sync: true
 meta_store:
   write_sync: true
 http:
-  max_connections: 300
+  max_connections: 650
+  max_ingestion_connections: 300
+  max_query_connections: 300
   read_time_out_in_seconds: 20
   write_time_out_in_seconds: 300 # 5 minutes to write the result
 
-gateways:
+cluster:
+  enable: false
+  distributed: false
+  namespace: ""
+  instance_id: ""
   # example controller client configs
   controller:
     address: localhost:6708
-    headers:
-      RPC-Caller:
-        - aresdb
-      RPC-Service:
-        - ares-controller
+  heartbeat:
+    timeout: 10
+    interval: 1
+  etcd:
+    zone: local 
+    env: dev
+    service: ares-datanode
+    etcdClusters:
+      - zone: local
+        endpoints:
+          - 127.0.0.1:2379
 
-cluster:
-  enable: false
-  cluster_name: ""
+redolog:
+  disk:
+    disabled: false
+  kafka:
+    enabled: false
 

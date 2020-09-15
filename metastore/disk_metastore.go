@@ -28,6 +28,7 @@ import (
 
 	"github.com/uber/aresdb/metastore/common"
 	"github.com/uber/aresdb/utils"
+	"math"
 )
 
 // meaningful defaults of table configurations.
@@ -136,11 +137,6 @@ func (dm *diskMetaStore) GetTable(name string) (*common.Table, error) {
 	return dm.readSchemaFile(name)
 }
 
-// GetOwnedShards returns the list of shards that are owned by this instance.
-func (dm *diskMetaStore) GetOwnedShards(table string) ([]int, error) {
-	return []int{0}, nil
-}
-
 // GetEnumDict gets the enum cases for given tableName and columnName
 func (dm *diskMetaStore) GetEnumDict(tableName, columnName string) ([]string, error) {
 	dm.RLock()
@@ -155,7 +151,7 @@ func (dm *diskMetaStore) GetEnumDict(tableName, columnName string) ([]string, er
 func (dm *diskMetaStore) GetArchivingCutoff(tableName string, shard int) (uint32, error) {
 	dm.RLock()
 	defer dm.RUnlock()
-	err := dm.shardExists(tableName, shard)
+	err := dm.tableExists(tableName)
 	if err != nil {
 		return 0, err
 	}
@@ -163,11 +159,19 @@ func (dm *diskMetaStore) GetArchivingCutoff(tableName string, shard int) (uint32
 	return dm.readVersion(file)
 }
 
+// DeleteTableShard deletes all table shard level metadata
+func (dm *diskMetaStore) DeleteTableShard(tableName string, shard int) error {
+	dm.Lock()
+	defer dm.Unlock()
+	shardDirPath := dm.getShardDirPath(tableName, shard)
+	return dm.RemoveAll(shardDirPath)
+}
+
 // GetSnapshotProgress gets the latest snapshot progress for given table and shard
 func (dm *diskMetaStore) GetSnapshotProgress(tableName string, shard int) (int64, uint32, int32, uint32, error) {
 	dm.RLock()
 	defer dm.RUnlock()
-	if err := dm.shardExists(tableName, shard); err != nil {
+	if err := dm.tableExists(tableName); err != nil {
 		return 0, 0, 0, 0, err
 	}
 	file := dm.getSnapshotRedoLogVersionAndOffsetFilePath(tableName, shard)
@@ -178,7 +182,7 @@ func (dm *diskMetaStore) GetSnapshotProgress(tableName string, shard int) (int64
 func (dm *diskMetaStore) UpdateArchivingCutoff(tableName string, shard int, cutoff uint32) error {
 	dm.Lock()
 	defer dm.Unlock()
-	if err := dm.shardExists(tableName, shard); err != nil {
+	if err := dm.tableExists(tableName); err != nil {
 		return err
 	}
 
@@ -188,7 +192,7 @@ func (dm *diskMetaStore) UpdateArchivingCutoff(tableName string, shard int, cuto
 	}
 
 	if !schema.IsFactTable {
-		return ErrNotFactTable
+		return common.ErrNotFactTable
 	}
 
 	file := dm.getShardVersionFilePath(tableName, shard)
@@ -199,7 +203,7 @@ func (dm *diskMetaStore) UpdateArchivingCutoff(tableName string, shard int, cuto
 func (dm *diskMetaStore) UpdateSnapshotProgress(tableName string, shard int, redoLogFile int64, upsertBatchOffset uint32, lastReadBatchID int32, lastReadBatchOffset uint32) error {
 	dm.Lock()
 	defer dm.Unlock()
-	if err := dm.shardExists(tableName, shard); err != nil {
+	if err := dm.tableExists(tableName); err != nil {
 		return err
 	}
 
@@ -209,7 +213,7 @@ func (dm *diskMetaStore) UpdateSnapshotProgress(tableName string, shard int, red
 	}
 
 	if schema.IsFactTable {
-		return ErrNotDimensionTable
+		return common.ErrNotDimensionTable
 	}
 
 	file := dm.getSnapshotRedoLogVersionAndOffsetFilePath(tableName, shard)
@@ -222,7 +226,7 @@ func (dm *diskMetaStore) UpdateBackfillProgress(table string, shard int, redoFil
 
 	dm.Lock()
 	defer dm.Unlock()
-	if err := dm.shardExists(table, shard); err != nil {
+	if err := dm.tableExists(table); err != nil {
 		return err
 	}
 
@@ -232,7 +236,7 @@ func (dm *diskMetaStore) UpdateBackfillProgress(table string, shard int, redoFil
 	}
 
 	if !schema.IsFactTable {
-		return ErrNotFactTable
+		return common.ErrNotFactTable
 	}
 
 	file := dm.getRedoLogVersionAndOffsetFilePath(table, shard)
@@ -243,12 +247,114 @@ func (dm *diskMetaStore) UpdateBackfillProgress(table string, shard int, redoFil
 func (dm *diskMetaStore) GetBackfillProgressInfo(table string, shard int) (int64, uint32, error) {
 	dm.RLock()
 	defer dm.RUnlock()
-	if err := dm.shardExists(table, shard); err != nil {
+	if err := dm.tableExists(table); err != nil {
 		return 0, 0, err
 	}
 
 	file := dm.getRedoLogVersionAndOffsetFilePath(table, shard)
 	return dm.readRedoLogFileAndOffset(file)
+}
+
+// Update ingestion commit offset, used for kafka like streaming ingestion
+func (dm *diskMetaStore) UpdateRedoLogCommitOffset(table string, shard int, offset int64) error {
+	dm.Lock()
+	defer dm.Unlock()
+
+	// No sanity check here for schema/fact table/directory, assuming all should be passed before calling this func
+	file := dm.getIngestionCommitOffsetFilePath(table, shard)
+	err := dm.MkdirAll(filepath.Dir(file), 0755)
+	if err != nil {
+		return utils.StackError(err, "Failed to create directory for redolog commit offset")
+	}
+
+	writer, err := dm.OpenFileForWrite(
+		file,
+		os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
+		0644,
+	)
+
+	if err != nil {
+		return utils.StackError(err, "Failed to open ingestion commit offset file %s for write", file)
+	}
+	defer writer.Close()
+
+	_, err = io.WriteString(writer, fmt.Sprintf("%d", offset))
+	return err
+}
+
+// Get ingestion commit offset, used for kafka like streaming ingestion
+func (dm *diskMetaStore) GetRedoLogCommitOffset(table string, shard int) (int64, error) {
+	dm.RLock()
+	defer dm.RUnlock()
+
+	// No sanity check here for schema/fact table/directory, assuming all should be passed before calling this func
+	file := dm.getIngestionCommitOffsetFilePath(table, shard)
+
+	fileBytes, err := dm.ReadFile(file)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, utils.StackError(err, "Failed to open ingestion commit offset file %s", file)
+	}
+
+	var offset int64
+	_, err = fmt.Fscanln(bytes.NewBuffer(fileBytes), &offset)
+	if err != nil {
+		return 0, utils.StackError(err, "Failed to read ingestion commit offset file %s", file)
+	}
+	return offset, nil
+}
+
+// Update ingestion checkpoint offset, used for kafka like streaming ingestion
+func (dm *diskMetaStore) UpdateRedoLogCheckpointOffset(table string, shard int, offset int64) error {
+	dm.Lock()
+	defer dm.Unlock()
+
+	// No sanity check here for schema/fact table/directory, assuming all should be passed before calling this func
+	file := dm.getIngestionCheckpointOffsetFilePath(table, shard)
+	err := dm.MkdirAll(filepath.Dir(file), 0755)
+	if err != nil {
+		return utils.StackError(err, "Failed to create directory for redolog checkpoint offset")
+	}
+
+	writer, err := dm.OpenFileForWrite(
+		file,
+		os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
+		0644,
+	)
+
+	if err != nil {
+		return utils.StackError(err, "Failed to open ingestion checkpoint offset file %s for write", file)
+	}
+	defer writer.Close()
+
+	_, err = io.WriteString(writer, fmt.Sprintf("%d", offset))
+	return err
+}
+
+// Get ingestion checkpoint offset, used for kafka like streaming ingestion
+func (dm *diskMetaStore) GetRedoLogCheckpointOffset(table string, shard int) (int64, error) {
+	dm.RLock()
+	defer dm.RUnlock()
+
+	// No sanity check here for schema/fact table/directory, assuming all should be passed before calling this func
+	file := dm.getIngestionCheckpointOffsetFilePath(table, shard)
+
+	fileBytes, err := dm.ReadFile(file)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, utils.StackError(err, "Failed to open ingestion checkpoint offset file %s", file)
+	}
+
+	var offset int64
+	_, err = fmt.Fscanln(bytes.NewBuffer(fileBytes), &offset)
+	if err != nil {
+		return 0, utils.StackError(err, "Failed to read ingestion checkpoint offset file %s", file)
+	}
+	return offset, nil
 }
 
 // WatchTableListEvents register a watcher to table list change events,
@@ -258,7 +364,7 @@ func (dm *diskMetaStore) WatchTableListEvents() (events <-chan []string, done ch
 	dm.Lock()
 	defer dm.Unlock()
 	if dm.tableListWatcher != nil {
-		return nil, nil, ErrWatcherAlreadyExist
+		return nil, nil, common.ErrWatcherAlreadyExist
 	}
 
 	watcherChan, doneChan := make(chan []string), make(chan struct{})
@@ -273,7 +379,7 @@ func (dm *diskMetaStore) WatchTableSchemaEvents() (events <-chan *common.Table, 
 	dm.Lock()
 	defer dm.Unlock()
 	if dm.tableSchemaWatcher != nil {
-		return nil, nil, ErrWatcherAlreadyExist
+		return nil, nil, common.ErrWatcherAlreadyExist
 	}
 
 	watcherChan, doneChan := make(chan *common.Table), make(chan struct{})
@@ -300,7 +406,7 @@ func (dm *diskMetaStore) WatchEnumDictEvents(table, column string, startCase int
 	}
 
 	if _, exist := dm.enumDictWatchers[table][column]; exist {
-		return nil, nil, ErrWatcherAlreadyExist
+		return nil, nil, common.ErrWatcherAlreadyExist
 	}
 
 	existingEnumCases, err := dm.readEnumFile(table, column)
@@ -330,7 +436,7 @@ func (dm *diskMetaStore) WatchShardOwnershipEvents() (events <-chan common.Shard
 	dm.Lock()
 	defer dm.Unlock()
 	if dm.shardOwnershipWatcher != nil {
-		return nil, nil, ErrWatcherAlreadyExist
+		return nil, nil, common.ErrWatcherAlreadyExist
 	}
 
 	watcherChan, doneChan := make(chan common.ShardOwnership), make(chan struct{})
@@ -361,7 +467,7 @@ func (dm *diskMetaStore) CreateTable(table *common.Table) (err error) {
 	}
 
 	if utils.IndexOfStr(existingTables, table.Name) >= 0 {
-		return ErrTableAlreadyExist
+		return common.ErrTableAlreadyExist
 	}
 
 	validator := NewTableSchameValidator()
@@ -381,7 +487,7 @@ func (dm *diskMetaStore) CreateTable(table *common.Table) (err error) {
 
 	// append enum case for enum column with default value
 	for _, column := range table.Columns {
-		if column.DefaultValue != nil && column.IsEnumColumn() {
+		if column.DefaultValue != nil && column.IsEnumBasedColumn() {
 			err = dm.writeEnumFile(table.Name, column.Name, []string{*column.DefaultValue})
 			if err != nil {
 				return err
@@ -389,8 +495,7 @@ func (dm *diskMetaStore) CreateTable(table *common.Table) (err error) {
 		}
 	}
 
-	// for single instance version, when creating table, create shard zero as well
-	return dm.createShard(table.Name, table.IsFactTable, 0)
+	return nil
 }
 
 // UpdateTable update table configurations
@@ -449,7 +554,7 @@ func (dm *diskMetaStore) UpdateTable(table common.Table) (err error) {
 	// append enum case for enum column with default value for new columns
 	for i := len(existingTable.Columns); i < len(table.Columns); i++ {
 		column := table.Columns[i]
-		if column.DefaultValue != nil && column.IsEnumColumn() {
+		if column.DefaultValue != nil && column.IsEnumBasedColumn() {
 			err = dm.writeEnumFile(table.Name, column.Name, []string{*column.DefaultValue})
 			if err != nil {
 				return
@@ -484,7 +589,7 @@ func (dm *diskMetaStore) DeleteTable(tableName string) (err error) {
 
 	index := utils.IndexOfStr(existingTables, tableName)
 	if index < 0 {
-		return ErrTableDoesNotExist
+		return common.ErrTableDoesNotExist
 	}
 
 	if err = dm.removeTable(tableName); err != nil {
@@ -578,7 +683,7 @@ func (dm *diskMetaStore) DeleteColumn(tableName string, columnName string) (err 
 }
 
 // ExtendEnumDict extends enum cases for given table column
-func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string) (enumIDs []int, err error) {
+func (dm *diskMetaStore) ExtendEnumDict(table, columnName string, enumCases []string) (enumIDs []int, err error) {
 	dm.writeLock.Lock()
 	defer dm.writeLock.Unlock()
 
@@ -590,7 +695,7 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 		dm.Unlock()
 		if err == nil {
 			if _, tableExist := dm.enumDictWatchers[table]; tableExist {
-				if watcher, columnExist := dm.enumDictWatchers[table][column]; columnExist {
+				if watcher, columnExist := dm.enumDictWatchers[table][columnName]; columnExist {
 					for _, enumCase := range newEnumCases {
 						watcher <- enumCase
 					}
@@ -599,11 +704,17 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 		}
 	}()
 
-	if err = dm.enumColumnExists(table, column); err != nil {
-		return nil, err
+	var column *common.Column
+	column, err = dm.getColumnByName(table, columnName)
+	if err != nil {
+		return
+	}
+	if !column.IsEnumBasedColumn() {
+		err = common.ErrNotEnumColumn
+		return
 	}
 
-	existingCases, err = dm.readEnumFile(table, column)
+	existingCases, err = dm.readEnumFile(table, columnName)
 	if err != nil {
 		return nil, err
 	}
@@ -614,6 +725,12 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 	}
 
 	newEnumID := len(existingCases)
+
+	enumCardinalityLimit := common.EnumCardinality(column.Type)
+	if newEnumID+len(enumCases) > enumCardinalityLimit {
+		err = common.ErrEnumCardinalityOverflow
+		return
+	}
 
 	enumIDs = make([]int, len(enumCases))
 	for index, newCase := range enumCases {
@@ -627,13 +744,13 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 		}
 	}
 
-	if err = dm.writeEnumFile(table, column, newEnumCases); err != nil {
+	if err = dm.writeEnumFile(table, columnName, newEnumCases); err != nil {
 		return nil, err
 	}
 
 	utils.GetRootReporter().GetChildGauge(map[string]string{
 		"table":      table,
-		"columnName": column,
+		"columnName": columnName,
 	}, utils.NumberOfEnumCasesPerColumn).Update(float64(newEnumID))
 
 	return enumIDs, nil
@@ -644,7 +761,7 @@ func (dm *diskMetaStore) PurgeArchiveBatches(tableName string, shard, batchIDSta
 	dm.Lock()
 	defer dm.Unlock()
 
-	if err := dm.shardExists(tableName, shard); err != nil {
+	if err := dm.tableExists(tableName); err != nil {
 		return err
 	}
 
@@ -676,24 +793,32 @@ func (dm *diskMetaStore) PurgeArchiveBatches(tableName string, shard, batchIDSta
 	return nil
 }
 
+// OverwriteArchiveBatchVersion overwrites batch version
+func (dm *diskMetaStore) OverwriteArchiveBatchVersion(tableName string, shard, batchID int, version uint32, seqNum uint32, batchSize int) error {
+	return dm.writeArchiveBatchVersionWithMode(tableName, shard, batchID, version, seqNum, batchSize, os.O_WRONLY|os.O_TRUNC|os.O_CREATE)
+}
+
 // AddArchiveBatchVersion adds a new version to archive batch.
 func (dm *diskMetaStore) AddArchiveBatchVersion(tableName string, shard, batchID int, version uint32, seqNum uint32, batchSize int) error {
+	return dm.writeArchiveBatchVersionWithMode(tableName, shard, batchID, version, seqNum, batchSize, os.O_WRONLY|os.O_APPEND|os.O_CREATE)
+}
+
+func (dm *diskMetaStore) writeArchiveBatchVersionWithMode(tableName string, shard, batchID int, version uint32, seqNum uint32, batchSize int, mode int) error {
 	dm.Lock()
 	defer dm.Unlock()
 
-	if err := dm.shardExists(tableName, shard); err != nil {
+	if err := dm.tableExists(tableName); err != nil {
 		return err
 	}
 
 	path := dm.getArchiveBatchVersionFilePath(tableName, shard, batchID)
-
 	if err := dm.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return utils.StackError(err, "Failed to create archive batch version directory")
 	}
 
 	writer, err := dm.OpenFileForWrite(
 		path,
-		os.O_WRONLY|os.O_APPEND|os.O_CREATE,
+		mode,
 		0644,
 	)
 
@@ -724,6 +849,35 @@ func (dm *diskMetaStore) AddArchiveBatchVersion(tableName string, shard, batchID
 	return nil
 }
 
+func (dm *diskMetaStore) GetArchiveBatches(table string, shard int, batchIDStart, batchIDEnd int32) ([]int, error) {
+	dm.RLock()
+	defer dm.RUnlock()
+
+	batchFiles, err := dm.ReadDir(dm.getArchiveBatchDirPath(table, shard))
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("fail to read archive batch directories: %v", err)
+	}
+
+	if batchIDEnd <= 0 {
+		batchIDEnd = math.MaxInt32
+	}
+	batchIDs := []int{}
+	for _, batchFile := range batchFiles {
+		batchID, err := strconv.ParseInt(batchFile.Name(), 10, 32)
+		if err != nil {
+			// we'll skip invalid batchID
+			continue
+		}
+
+		if batchID <= int64(batchIDEnd) && batchID >= int64(batchIDStart) {
+			batchIDs = append(batchIDs, int(batchID))
+		}
+	}
+	return batchIDs, nil
+}
+
 // GetArchiveBatchVersion gets the latest version <= given archiving/live cutoff
 // all cutoff and batch versions are sorted in file per batch
 // sample:
@@ -743,7 +897,7 @@ func (dm *diskMetaStore) GetArchiveBatchVersion(table string, shard, batchID int
 	dm.RLock()
 	defer dm.RUnlock()
 
-	if err := dm.shardExists(table, shard); err != nil {
+	if err := dm.tableExists(table); err != nil {
 		return 0, 0, 0, err
 	}
 
@@ -887,7 +1041,7 @@ func (dm *diskMetaStore) addColumn(table *common.Table, column common.Column, ap
 	}
 
 	// if enum column, append a enum case for default value
-	if column.DefaultValue != nil && column.IsEnumColumn() {
+	if column.DefaultValue != nil && column.IsEnumBasedColumn() {
 		return dm.writeEnumFile(table.Name, column.Name, []string{*column.DefaultValue})
 	}
 
@@ -907,7 +1061,7 @@ func (dm *diskMetaStore) updateColumn(table *common.Table, columnName string, co
 			return dm.writeSchemaFile(table)
 		}
 	}
-	return ErrColumnDoesNotExist
+	return common.ErrColumnDoesNotExist
 }
 
 func (dm *diskMetaStore) removeColumn(table *common.Table, columnName string) error {
@@ -921,11 +1075,11 @@ func (dm *diskMetaStore) removeColumn(table *common.Table, columnName string) er
 
 			// trying to delete timestamp column from fact table
 			if table.IsFactTable && id == 0 {
-				return ErrDeleteTimeColumn
+				return common.ErrDeleteTimeColumn
 			}
 
 			if utils.IndexOfInt(table.PrimaryKeyColumns, id) >= 0 {
-				return ErrDeletePrimaryKeyColumn
+				return common.ErrDeletePrimaryKeyColumn
 			}
 
 			column.Deleted = true
@@ -934,14 +1088,14 @@ func (dm *diskMetaStore) removeColumn(table *common.Table, columnName string) er
 				return err
 			}
 
-			if column.IsEnumColumn() {
+			if column.IsEnumBasedColumn() {
 				dm.removeEnumColumn(table.Name, column.Name)
 			}
 
 			return nil
 		}
 	}
-	return ErrColumnDoesNotExist
+	return common.ErrColumnDoesNotExist
 }
 
 func (dm *diskMetaStore) getTableDirPath(tableName string) string {
@@ -988,6 +1142,16 @@ func (dm *diskMetaStore) getSnapshotRedoLogVersionAndOffsetFilePath(tableName st
 	return filepath.Join(dm.getShardDirPath(tableName, shard), "snapshot")
 }
 
+// Get file path which stores the ingestion commit offset, mainly used for kafka or other streaming based ingestion
+func (dm *diskMetaStore) getIngestionCommitOffsetFilePath(tableName string, shard int) string {
+	return filepath.Join(dm.getShardDirPath(tableName, shard), "commit-offset")
+}
+
+// Get file path which stores the ingestion checkpoint offset, mainly used fo kafka or other streaming based ingestion
+func (dm *diskMetaStore) getIngestionCheckpointOffsetFilePath(tableName string, shard int) string {
+	return filepath.Join(dm.getShardDirPath(tableName, shard), "checkpoint-offset")
+}
+
 // readEnumFile reads the enum cases from file.
 func (dm *diskMetaStore) readEnumFile(tableName, columnName string) ([]string, error) {
 	enumBytes, err := dm.ReadFile(dm.getEnumFilePath(tableName, columnName))
@@ -1010,6 +1174,7 @@ func (dm *diskMetaStore) writeEnumFile(tableName, columnName string, enumCases [
 	if len(enumCases) == 0 {
 		return nil
 	}
+
 	err := dm.MkdirAll(dm.getEnumDirPath(tableName), 0755)
 	if err != nil {
 		return utils.StackError(err, "Failed to create enums directory")
@@ -1259,23 +1424,21 @@ func (dm *diskMetaStore) removeEnumColumn(tableName, columnName string) {
 func (dm *diskMetaStore) tableExists(tableName string) error {
 	_, err := dm.Stat(dm.getSchemaFilePath(tableName))
 	if os.IsNotExist(err) {
-		return ErrTableDoesNotExist
+		return common.ErrTableDoesNotExist
 	} else if err != nil {
 		return utils.StackError(err, "Failed to read directory, table: %s", tableName)
 	}
 	return nil
 }
 
-// enumColumnExists checks whether column exists and it is a enum column,
-// return ErrTableDoesNotExist, ErrColumnDoesNotExist, ErrNotEnumColumn.
-func (dm *diskMetaStore) enumColumnExists(tableName string, columnName string) error {
+func (dm *diskMetaStore) getColumnByName(tableName, columnName string) (*common.Column, error) {
 	if err := dm.tableExists(tableName); err != nil {
-		return err
+		return nil, err
 	}
 
 	table, err := dm.readSchemaFile(tableName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, column := range table.Columns {
@@ -1286,50 +1449,31 @@ func (dm *diskMetaStore) enumColumnExists(tableName string, columnName string) e
 				continue
 			}
 
-			if !column.IsEnumColumn() {
-				return ErrNotEnumColumn
+			if !column.IsEnumBasedColumn() {
+				return nil, common.ErrNotEnumColumn
 			}
-
-			return nil
+			return &column, nil
 		}
 	}
-	return ErrColumnDoesNotExist
+	return nil, common.ErrColumnDoesNotExist
 }
 
-// shardExists checks whether shard exists,
-// return ErrShardDoesNotExist.
-func (dm *diskMetaStore) shardExists(tableName string, shard int) error {
-	if err := dm.tableExists(tableName); err != nil {
+// enumColumnExists checks whether column exists and it is a enum column,
+// return ErrTableDoesNotExist, ErrColumnDoesNotExist, ErrNotEnumColumn.
+func (dm *diskMetaStore) enumColumnExists(tableName string, columnName string) error {
+	column, err := dm.getColumnByName(tableName, columnName)
+	if err != nil {
 		return err
 	}
-
-	_, err := dm.Stat(dm.getShardDirPath(tableName, shard))
-	if os.IsNotExist(err) {
-		return ErrShardDoesNotExist
-	} else if err != nil {
-		return utils.StackError(err, "Failed to read directory, table: %s, shard: %d", tableName, shard)
+	if !column.IsEnumBasedColumn() {
+		return common.ErrNotEnumColumn
 	}
 
-	return nil
-}
-
-// createShard assume table is created already
-func (dm *diskMetaStore) createShard(tableName string, isFactTable bool, shard int) error {
-	var err error
-	if isFactTable {
-		// only fact table have archive batches directory
-		err = dm.MkdirAll(filepath.Join(dm.getShardDirPath(tableName, 0), "batches"), 0755)
-	} else {
-		err = dm.MkdirAll(dm.getShardDirPath(tableName, 0), 0755)
-	}
-	if err != nil {
-		return utils.StackError(err, "Failed to create shard directory, table: %s, shard: %d", tableName, shard)
-	}
 	return nil
 }
 
 // NewDiskMetaStore creates a new disk based metastore
-func NewDiskMetaStore(basePath string) (MetaStore, error) {
+func NewDiskMetaStore(basePath string) (common.MetaStore, error) {
 	metaStore := &diskMetaStore{
 		FileSystem:       utils.OSFileSystem{},
 		basePath:         basePath,

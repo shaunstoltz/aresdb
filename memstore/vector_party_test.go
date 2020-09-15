@@ -15,6 +15,7 @@
 package memstore
 
 import (
+	"github.com/uber/aresdb/memstore/vectors"
 	"unsafe"
 
 	"github.com/onsi/ginkgo"
@@ -25,7 +26,29 @@ import (
 
 var _ = ginkgo.Describe("VectorParty", func() {
 
-	ginkgo.It("Iterator should work", func() {
+	ginkgo.It("GetHostVectorPartySlice should work", func() {
+		locker := &sync.RWMutex{}
+		sourceVP, err := testFactory.ReadArchiveVectorParty("sortedVP4", locker)
+		Ω(err).Should(BeNil())
+		vp := sourceVP.(*archiveVectorParty)
+		hostVPSlice := vp.GetHostVectorPartySlice(0, vp.length)
+		Ω(hostVPSlice).Should(Equal(common.HostVectorPartySlice{
+			Values:          vp.values.Buffer(),
+			Nulls:           vp.nulls.Buffer(),
+			Counts:          vp.counts.Buffer(),
+			Length:          5,
+			ValueType:       vp.dataType,
+			DefaultValue:    vp.defaultValue,
+			ValueStartIndex: 0,
+			NullStartIndex:  0,
+			CountStartIndex: 0,
+			ValueBytes:      64,
+			NullBytes:       64,
+			CountBytes:      64,
+		}))
+	})
+
+	ginkgo.It("Slice should work", func() {
 		locker := &sync.RWMutex{}
 		vp, err := testFactory.ReadArchiveVectorParty("sortedVP4", locker)
 		Ω(err).Should(BeNil())
@@ -104,6 +127,7 @@ var _ = ginkgo.Describe("VectorParty", func() {
 		Ω(endIndex).Should(Equal(2))
 
 		vp5, err := testFactory.ReadArchiveVectorParty("sortedVP5", locker)
+
 		value = 1
 		startRow, endRow, startIndex, endIndex = vp5.SliceByValue(
 			0, 5, unsafe.Pointer(&value))
@@ -119,7 +143,7 @@ var _ = ginkgo.Describe("VectorParty", func() {
 			Valid:    true,
 		}
 
-		vp5.defaultValue = defaultValue
+		vp5.(*archiveVectorParty).defaultValue = defaultValue
 		startRow, endRow, startIndex, endIndex = vp5.SliceByValue(
 			0, 5, unsafe.Pointer(&value))
 		Ω(startRow).Should(Equal(0))
@@ -162,8 +186,8 @@ var _ = ginkgo.Describe("VectorParty", func() {
 		}
 
 		vp := cVectorParty{
-			values: NewVector(common.Uint32, 100),
-			nulls:  NewVector(common.Bool, 100),
+			values: vectors.NewVector(common.Uint32, 100),
+			nulls:  vectors.NewVector(common.Bool, 100),
 			baseVectorParty: baseVectorParty{
 				dataType:     common.Uint32,
 				defaultValue: defaultValue,
@@ -179,7 +203,7 @@ var _ = ginkgo.Describe("VectorParty", func() {
 
 		Ω(func() {
 			vp := &cVectorParty{
-				values: NewVector(common.Uint32, 100),
+				values: vectors.NewVector(common.Uint32, 100),
 				baseVectorParty: baseVectorParty{
 					dataType:     common.Uint32,
 					defaultValue: defaultValue,
@@ -194,7 +218,7 @@ var _ = ginkgo.Describe("VectorParty", func() {
 					dataType:     common.Uint32,
 					defaultValue: defaultValue,
 				},
-				nulls: NewVector(common.Bool, 100),
+				nulls: vectors.NewVector(common.Bool, 100),
 			}
 			vp.fillWithDefaultValue()
 		}).Should(Panic())
@@ -215,8 +239,8 @@ var _ = ginkgo.Describe("VectorParty", func() {
 		}
 
 		vp = cVectorParty{
-			values: NewVector(common.Bool, 100),
-			nulls:  NewVector(common.Bool, 100),
+			values: vectors.NewVector(common.Bool, 100),
+			nulls:  vectors.NewVector(common.Bool, 100),
 			baseVectorParty: baseVectorParty{
 				dataType:     common.Bool,
 				defaultValue: defaultValue,
@@ -247,8 +271,8 @@ var _ = ginkgo.Describe("VectorParty", func() {
 					dataType:     common.Uint32,
 					defaultValue: defaultValue,
 				},
-				values: NewVector(common.Uint32, 100),
-				nulls:  NewVector(common.Bool, 100),
+				values: vectors.NewVector(common.Uint32, 100),
+				nulls:  vectors.NewVector(common.Bool, 100),
 			},
 		}
 
@@ -271,8 +295,8 @@ var _ = ginkgo.Describe("VectorParty", func() {
 
 		vp = archiveVectorParty{
 			cVectorParty: cVectorParty{
-				values: NewVector(common.Uint32, 100),
-				nulls:  NewVector(common.Bool, 100),
+				values: vectors.NewVector(common.Uint32, 100),
+				nulls:  vectors.NewVector(common.Bool, 100),
 				baseVectorParty: baseVectorParty{
 					dataType:     common.Uint32,
 					defaultValue: common.NullDataValue,
@@ -295,8 +319,8 @@ var _ = ginkgo.Describe("VectorParty", func() {
 					dataType:     common.Uint32,
 					defaultValue: defaultValue,
 				},
-				values: NewVector(common.Uint32, 100),
-				nulls:  NewVector(common.Bool, 100),
+				values: vectors.NewVector(common.Uint32, 100),
+				nulls:  vectors.NewVector(common.Bool, 100),
 			},
 		}
 
@@ -310,7 +334,7 @@ var _ = ginkgo.Describe("VectorParty", func() {
 			CmpFunc:  common.GetCompareFunc(common.Uint32),
 		}
 
-		vp.SetDataValue(0, zeroValue, IncrementCount)
+		vp.SetDataValue(0, zeroValue, common.IncrementCount)
 
 		vp.Prune()
 		Ω(vp.GetMode()).Should(Equal(common.AllValuesPresent))

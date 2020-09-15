@@ -22,20 +22,23 @@ import (
 
 	"fmt"
 	"github.com/stretchr/testify/mock"
+	"github.com/uber/aresdb/common"
 	"github.com/uber/aresdb/diskstore"
 	diskMocks "github.com/uber/aresdb/diskstore/mocks"
 	"github.com/uber/aresdb/memstore"
+	memCom "github.com/uber/aresdb/memstore/common"
 	memComMocks "github.com/uber/aresdb/memstore/common/mocks"
 	memMocks "github.com/uber/aresdb/memstore/mocks"
-	"github.com/uber/aresdb/metastore"
+	metaCom "github.com/uber/aresdb/metastore/common"
 	metaMocks "github.com/uber/aresdb/metastore/mocks"
+	"github.com/uber/aresdb/redolog"
 	"github.com/uber/aresdb/testing"
 )
 
 // CreateMockDiskStore creates a mocked DiskStore for testing.
 func CreateMockDiskStore() *diskMocks.DiskStore {
 	diskStore := &diskMocks.DiskStore{}
-	diskStore.On("OpenLogFileForAppend", mock.Anything, mock.Anything, mock.Anything).Return(&testing.TestReadWriteCloser{}, nil)
+	diskStore.On("OpenLogFileForAppend", mock.Anything, mock.Anything, mock.Anything).Return(&testing.TestReadWriteSyncCloser{}, nil)
 	return diskStore
 }
 
@@ -55,9 +58,11 @@ func CreateMockHostMemoryManger() *memComMocks.HostMemoryManager {
 }
 
 // CreateMemStore creates a mocked MemStore for testing.
-func CreateMemStore(schema *memstore.TableSchema, shardID int, metaStore metastore.MetaStore,
+func CreateMemStore(schema *memCom.TableSchema, shardID int, metaStore metaCom.MetaStore,
 	diskStore diskstore.DiskStore) *memMocks.MemStore {
-	shard := memstore.NewTableShard(schema, metaStore, diskStore, CreateMockHostMemoryManger(), shardID)
+	redoManagerFactory, _ := redolog.NewRedoLogManagerMaster("", &common.RedoLogConfig{}, diskStore, metaStore)
+	options := memstore.NewOptions(new(memComMocks.BootStrapToken), redoManagerFactory)
+	shard := memstore.NewTableShard(schema, metaStore, diskStore, CreateMockHostMemoryManger(), shardID, 1, options)
 
 	memStore := new(memMocks.MemStore)
 	memStore.On("GetTableShard", schema.Schema.Name, shardID).Return(shard, nil).
@@ -66,7 +71,7 @@ func CreateMemStore(schema *memstore.TableSchema, shardID int, metaStore metasto
 		})
 	memStore.On("GetSchema", schema.Schema.Name).Return(schema, nil)
 	memStore.On("GetSchema", mock.Anything).Return(nil, fmt.Errorf("some error"))
-	memStore.On("GetSchemas").Return(map[string]*memstore.TableSchema{schema.Schema.Name: schema})
+	memStore.On("GetSchemas").Return(map[string]*memCom.TableSchema{schema.Schema.Name: schema})
 	memStore.On("RLock").Return()
 	memStore.On("RUnlock").Return()
 	memStore.On("Lock").Return()

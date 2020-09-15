@@ -15,12 +15,12 @@
 package memstore
 
 import (
-	"sync"
-
+	"github.com/uber/aresdb/datanode/bootstrap"
 	"github.com/uber/aresdb/diskstore"
 	"github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/metastore"
+	metaCom "github.com/uber/aresdb/metastore/common"
 	"github.com/uber/aresdb/utils"
+	"sync"
 )
 
 // TableShard stores the data for one table shard in memory.
@@ -31,11 +31,12 @@ type TableShard struct {
 	ShardID int `json:"-"`
 
 	// For convenience, reference to the table schema struct.
-	Schema *TableSchema `json:"schema"`
+	Schema *common.TableSchema `json:"schema"`
 
 	// For convenience.
-	metaStore metastore.MetaStore
+	metaStore metaCom.MetaStore
 	diskStore diskstore.DiskStore
+	options   Options
 
 	// Live store. Its locks also cover the primary key.
 	LiveStore *LiveStore `json:"liveStore"`
@@ -49,21 +50,41 @@ type TableShard struct {
 
 	// For convenience.
 	HostMemoryManager common.HostMemoryManager `json:"-"`
+
+	// bootstrapLock protects BootstrapState
+	bootstrapLock  sync.RWMutex
+	BootstrapState bootstrap.BootstrapState `json:"BootstrapState"`
+
+	// BootstrapDetails shows the details of bootstrap
+	BootstrapDetails bootstrap.BootstrapDetails `json:"bootstrapDetails,omitempty"`
+	// needPeerCopy mark whether the table shard need to copy data from peer
+	// before own disk data is available for serve
+	// default to 0 (no need for peer copy)
+	needPeerCopy uint32
 }
 
 // NewTableShard creates and initiates a table shard based on the schema.
-func NewTableShard(schema *TableSchema, metaStore metastore.MetaStore,
-	diskStore diskstore.DiskStore, hostMemoryManager common.HostMemoryManager, shard int) *TableShard {
+func NewTableShard(schema *common.TableSchema,
+	metaStore metaCom.MetaStore,
+	diskStore diskstore.DiskStore,
+	hostMemoryManager common.HostMemoryManager,
+	shard int,
+	totalShardsInCluster int,
+	options Options,
+) *TableShard {
 	tableShard := &TableShard{
 		ShardID:           shard,
 		Schema:            schema,
 		diskStore:         diskStore,
 		metaStore:         metaStore,
 		HostMemoryManager: hostMemoryManager,
+		options:           options,
+		BootstrapDetails:  bootstrap.NewBootstrapDetails(),
 	}
+
 	archiveStore := NewArchiveStore(tableShard)
 	tableShard.ArchiveStore = archiveStore
-	tableShard.LiveStore = NewLiveStore(schema.Schema.Config.BatchSize, tableShard)
+	tableShard.LiveStore = NewLiveStore(schema.Schema.Config.BatchSize, totalShardsInCluster, tableShard)
 	return tableShard
 }
 
@@ -72,6 +93,8 @@ func NewTableShard(schema *TableSchema, metaStore metastore.MetaStore,
 func (shard *TableShard) Destruct() {
 	// TODO: if this blocks on archiving for too long, figure out a way to cancel it.
 	shard.Users.Wait()
+
+	shard.options.redoLogMaster.Close(shard.Schema.Schema.Name, shard.ShardID)
 
 	shard.LiveStore.Destruct()
 

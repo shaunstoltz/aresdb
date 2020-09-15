@@ -15,6 +15,7 @@
 package memstore
 
 import (
+	"github.com/uber/aresdb/cluster/topology"
 	"sync"
 
 	"math"
@@ -24,13 +25,13 @@ import (
 	"github.com/uber/aresdb/utils"
 )
 
-// ReplayRedoLogs loads data for the table Shard from disk store and recovers the Shard for serving.
-func (shard *TableShard) ReplayRedoLogs() {
+// PlayRedoLog loads data for the table Shard from disk store and recovers the Shard for serving.
+func (shard *TableShard) PlayRedoLog() {
 	timer := utils.GetReporter(shard.Schema.Schema.Name, shard.ShardID).GetTimer(utils.RecoveryLatency).Start()
 	defer timer.Stop()
 
-	utils.GetLogger().Infof("Replay redo logs for Shard %d of table %s",
-		shard.ShardID, shard.Schema.Schema.Name)
+	utils.GetLogger().With("table", shard.Schema.Schema.Name, "shard", shard.ShardID).Info(
+		"Replay redo logs")
 
 	var redoLogFilePersisted int64
 	var offsetPersisted uint32
@@ -40,71 +41,81 @@ func (shard *TableShard) ReplayRedoLogs() {
 	} else {
 		redoLogFilePersisted, offsetPersisted, _, _ = shard.LiveStore.SnapshotManager.GetLastSnapshotInfo()
 	}
-	utils.GetLogger().Infof("Checkpointed redoLogFile=%d offset=%d", redoLogFilePersisted, offsetPersisted)
+	utils.GetLogger().With("table", shard.Schema.Schema.Name, "shard", shard.ShardID, "redoLogFile",
+		redoLogFilePersisted, "offset", offsetPersisted).Info("Checkpointed redolog file")
 
-	// Replay redo logs to create LiveStore.
-	nextUpsertBatch := shard.LiveStore.RedoLogManager.NextUpsertBatch()
-
-	for {
-		upsertBatch, redoLogFile, offset := nextUpsertBatch()
-
-		if upsertBatch == nil {
-			break
-		}
-
-		shard.LiveStore.WriterLock.Lock()
-
-		// Put a 0 in maxEventTimePerFile in case this is redolog is full of backfill batches.
-		shard.LiveStore.RedoLogManager.UpdateMaxEventTime(0, redoLogFile)
-
-		// check if this batch has already been backfilled and persisted
-		skipBackfillRows := redoLogFile < redoLogFilePersisted ||
-			(redoLogFile == redoLogFilePersisted && offset <= offsetPersisted)
-
-		_, err := shard.ApplyUpsertBatch(upsertBatch, redoLogFile, offset, skipBackfillRows)
-
-		shard.LiveStore.WriterLock.Unlock()
-
+	go func() {
+		nextUpsertBatchFunc, err := shard.LiveStore.RedoLogManager.Iterator()
 		if err != nil {
-			utils.GetLogger().With("err", err).Panic("Failed to apply upsert batch during recovery")
+			panic("Fail to start redolog manager")
 		}
-	}
+		for {
+			batchInfo := nextUpsertBatchFunc()
+			if batchInfo == nil {
+				utils.GetLogger().With("table", shard.Schema.Schema.Name, "shard", shard.ShardID).Info("Redolog manager stopped")
+				return
+			}
+			var skipBackfillRows bool
+			if batchInfo.Recovery {
+				// check if this batch has already been backfilled and persisted
+				skipBackfillRows = batchInfo.RedoLogFile < redoLogFilePersisted ||
+					(batchInfo.RedoLogFile == redoLogFilePersisted && batchInfo.BatchOffset <= offsetPersisted)
+			}
+			if err = shard.saveUpsertBatch(batchInfo.Batch, batchInfo.RedoLogFile, batchInfo.BatchOffset, batchInfo.Recovery, skipBackfillRows); err != nil {
+				if batchInfo.Recovery {
+					utils.GetLogger().With("error", err).Panic("Failed to apply upsert batch during recovery")
+				} else {
+					// for normal ingestion, will log error and keep going
+					utils.GetLogger().With("action", "ingestion", "table", shard.Schema.Schema.Name, "shard", shard.ShardID, "redologFile", batchInfo.RedoLogFile,
+						"offset", batchInfo.BatchOffset, "error", err).Error("Failed to apply upsert batch")
+					utils.GetReporter(shard.Schema.Schema.Name, shard.ShardID).GetCounter(utils.IngestedErrorBatches).Inc(1)
+				}
+			}
+		}
+	}()
+
+	shard.LiveStore.RedoLogManager.WaitForRecoveryDone()
 
 	// report redolog size after replay
-	utils.GetReporter(shard.Schema.Schema.Name, shard.ShardID).GetGauge(utils.NumberOfRedologs).Update(float64(len(shard.LiveStore.RedoLogManager.SizePerFile)))
-	utils.GetReporter(shard.Schema.Schema.Name, shard.ShardID).GetGauge(utils.SizeOfRedologs).Update(float64(shard.LiveStore.RedoLogManager.TotalRedoLogSize))
+	utils.GetReporter(shard.Schema.Schema.Name, shard.ShardID).GetGauge(utils.NumberOfRedologs).Update(float64(shard.LiveStore.RedoLogManager.GetNumFiles()))
+	utils.GetReporter(shard.Schema.Schema.Name, shard.ShardID).GetGauge(utils.SizeOfRedologs).Update(float64(shard.LiveStore.RedoLogManager.GetTotalSize()))
 
 	// proactively purge redo files
 	if shard.LiveStore.BackfillManager != nil {
 		shard.LiveStore.RedoLogManager.
-			PurgeRedologFileAndData(shard.LiveStore.ArchivingCutoffHighWatermark, redoLogFilePersisted, offsetPersisted)
+			CheckpointRedolog(shard.LiveStore.ArchivingCutoffHighWatermark, redoLogFilePersisted, offsetPersisted)
 	}
 }
 
 func (shard *TableShard) cleanOldSnapshotAndLogs(redoLogFile int64, offset uint32) {
 	tableName := shard.Schema.Schema.Name
 	// snapshot won't care about the cutoff.
-	if err := shard.LiveStore.RedoLogManager.PurgeRedologFileAndData(math.MaxUint32, redoLogFile, offset); err != nil {
+	if err := shard.LiveStore.RedoLogManager.CheckpointRedolog(math.MaxUint32, redoLogFile, offset); err != nil {
 		utils.GetLogger().With(
 			"job", "snapshot_cleanup",
 			"table", tableName).Errorf(
 			"Purge redologs failed, shard: %d, error: %v", shard.ShardID, err)
 	}
-	// delete old snapshots
-	if err := shard.diskStore.DeleteSnapshot(shard.Schema.Schema.Name, shard.ShardID, redoLogFile, offset); err != nil {
-		utils.GetLogger().With(
-			"job", "snapshot_cleanup",
-			"table", tableName).Errorf(
-			"Delete snapshots failed, shard: %d, error: %v", shard.ShardID, err)
+
+	if shard.options.bootstrapToken.AcquireToken(tableName, uint32(shard.ShardID)) {
+		defer shard.options.bootstrapToken.ReleaseToken(tableName, uint32(shard.ShardID))
+
+		// delete old snapshots
+		if err := shard.diskStore.DeleteSnapshot(shard.Schema.Schema.Name, shard.ShardID, redoLogFile, offset); err != nil {
+			utils.GetLogger().With(
+				"job", "snapshot_cleanup",
+				"table", tableName).Errorf(
+				"Delete snapshots failed, shard: %d, error: %v", shard.ShardID, err)
+		}
 	}
 }
 
 // LoadMetaData loads metadata for the table Shard from metastore.
-func (shard *TableShard) LoadMetaData() {
+func (shard *TableShard) LoadMetaData() error {
 	if shard.Schema.Schema.IsFactTable {
 		cutoff, err := shard.metaStore.GetArchivingCutoff(shard.Schema.Schema.Name, shard.ShardID)
 		if err != nil {
-			utils.GetLogger().Panic(err)
+			return err
 		}
 
 		shard.ArchiveStore.CurrentVersion = NewArchiveStoreVersion(cutoff, shard)
@@ -118,7 +129,7 @@ func (shard *TableShard) LoadMetaData() {
 		// retrieve redoLog/offset checkpointed for backfill
 		redoLog, offset, err := shard.metaStore.GetBackfillProgressInfo(shard.Schema.Schema.Name, shard.ShardID)
 		if err != nil {
-			utils.GetLogger().Panic(err)
+			return err
 		}
 
 		shard.LiveStore.BackfillManager.LastRedoFile = redoLog
@@ -126,12 +137,13 @@ func (shard *TableShard) LoadMetaData() {
 	} else {
 		redoLogFile, offset, batchID, lastRecord, err := shard.metaStore.GetSnapshotProgress(shard.Schema.Schema.Name, shard.ShardID)
 		if err != nil {
-			utils.GetLogger().Panic(err)
+			return err
 		}
 		// retrieve latest snapshot info
-		record := RecordID{BatchID: batchID, Index: lastRecord}
+		record := memcom.RecordID{BatchID: batchID, Index: lastRecord}
 		shard.LiveStore.SnapshotManager.SetLastSnapshotInfo(redoLogFile, offset, record)
 	}
+	return nil
 }
 
 // loadSnapshots load snapshots for dimension tables
@@ -171,8 +183,8 @@ func (m *memStoreImpl) loadSnapshots() {
 	utils.GetLogger().Info("Finish loading snapshots for all table shards")
 }
 
-// replayRedoLogs replay redo logs for all tables in parallel.
-func (m *memStoreImpl) replayRedoLogs() {
+// playRedoLogs replay redo logs for all tables in parallel, and then start the data ingestion
+func (m *memStoreImpl) playRedoLogs() {
 	utils.GetLogger().Info("Start replaying redo logs for all table shards")
 	var wg sync.WaitGroup
 	for table := range m.TableSchemas {
@@ -186,7 +198,7 @@ func (m *memStoreImpl) replayRedoLogs() {
 					"table", shard.Schema.Schema.Name,
 					"shard", shard.ShardID).
 					Info("Replaying redo logs")
-				shard.ReplayRedoLogs()
+				shard.PlayRedoLog()
 				utils.GetLogger().With(
 					"job", "replay_redo_logs",
 					"table", shard.Schema.Schema.Name,
@@ -202,13 +214,10 @@ func (m *memStoreImpl) replayRedoLogs() {
 
 // InitShards loads/recovers data for shards initially owned by the current instance.
 // It also watches Shard ownership change events and handles them in a separate goroutine.
-func (m *memStoreImpl) InitShards(schedulerOff bool) {
-	for table, schema := range m.TableSchemas {
-		shards, err := m.metaStore.GetOwnedShards(table)
-		if err != nil {
-			utils.GetLogger().Panic(err)
-		}
-
+// InitShards is only used in non sharded version which assume totalShardsInCluster to be one
+func (m *memStoreImpl) InitShards(schedulerOff bool, shardOwner topology.ShardOwner) {
+	for _, schema := range m.TableSchemas {
+		shards := shardOwner.GetOwnedShards()
 		for _, shard := range shards {
 			if err := m.LoadShard(schema, shard, false); err != nil {
 				utils.GetLogger().Panic(err)
@@ -218,6 +227,8 @@ func (m *memStoreImpl) InitShards(schedulerOff bool) {
 
 	// tryPreload data according the column retention config and start the go routines
 	// to do eviction and preloading.
+	m.preloadAllFactTables()
+	// Start host memory manager
 	m.HostMemManager.Start()
 
 	// load snapshot for dimension tables
@@ -227,13 +238,21 @@ func (m *memStoreImpl) InitShards(schedulerOff bool) {
 	// the backfill queue.
 	if !schedulerOff {
 		// Start scheduler.
-		utils.GetLogger().Infof("Starting archiving scheduler")
+		utils.GetLogger().Info("Starting archiving scheduler")
+		// disable archiving during redolog replay
+		m.GetScheduler().EnableJobType(memcom.ArchivingJobType, false)
+		// this will start scheduler of all jobs except archiving, archiving will be started individually
 		m.GetScheduler().Start()
 	} else {
-		utils.GetLogger().Infof("Scheduler is off")
+		utils.GetLogger().Info("Scheduler is off")
 	}
 
-	m.replayRedoLogs()
+	m.playRedoLogs()
+
+	if !schedulerOff {
+		// re-enable archiving after redolog replay
+		m.GetScheduler().EnableJobType(memcom.ArchivingJobType, true)
+	}
 
 	// watch Shard ownership change
 	shardOwnershipChangeEvents, done, err := m.metaStore.WatchShardOwnershipEvents()
@@ -284,11 +303,15 @@ func (m *memStoreImpl) InitShards(schedulerOff bool) {
 
 // LoadShard loads/recovers the specified Shard and attaches it to memStoreImpl for serving. If will load the metadata
 // first and then replay redologs only if replayRedologs is true.
-func (m *memStoreImpl) LoadShard(schema *TableSchema, shard int, replayRedologs bool) error {
-	tableShard := NewTableShard(schema, m.metaStore, m.diskStore, m.HostMemManager, shard)
-	tableShard.LoadMetaData()
+// LoadShard is only used in non sharded version, whihch assume totalShardsInCluster to be 1
+func (m *memStoreImpl) LoadShard(schema *memcom.TableSchema, shard int, replayRedologs bool) error {
+	tableShard := NewTableShard(schema, m.metaStore, m.diskStore, m.HostMemManager, shard, 1, m.options)
+	err := tableShard.LoadMetaData()
+	if err != nil {
+		utils.GetLogger().Panic(err)
+	}
 	if replayRedologs {
-		tableShard.ReplayRedoLogs()
+		tableShard.PlayRedoLog()
 	}
 
 	m.Lock()
@@ -396,7 +419,8 @@ func (shard *TableShard) loadTableShardSnapshot(
 		} else {
 			// found the column in snapshot, read from snapshot file
 			vp = NewLiveVectorParty(batch.Capacity, dataTypes[colID], *defaultValues[colID], shard.HostMemoryManager)
-			serializer := NewVectorPartySnapshotSerializer(shard, colID, int(batchID), 0, 0, redoLogFile, offset)
+			serializer := memcom.NewVectorPartySnapshotSerializer(shard.HostMemoryManager, shard.diskStore, shard.Schema.Schema.Name, shard.ShardID,
+				colID, int(batchID), 0, 0, redoLogFile, offset)
 			if err := serializer.ReadVectorParty(vp); err != nil {
 				return 0, err
 			}
@@ -421,19 +445,17 @@ func (shard *TableShard) rebuildIndexForLiveStore(batchID int32, lastRecord uint
 	batch := shard.LiveStore.Batches[batchID]
 	primaryKeyBytes := shard.Schema.PrimaryKeyBytes
 	primaryKeyColumns := shard.Schema.GetPrimaryKeyColumns()
-	var key []byte
+	key := make([]byte, primaryKeyBytes)
 	var err error
-	primaryKeyValues := make([]memcom.DataValue, len(primaryKeyColumns))
 
 	var row uint32
 	for row = 0; row <= lastRecord; row++ {
-		for i, col := range primaryKeyColumns {
-			primaryKeyValues[i] = batch.Columns[col].GetDataValue(int(row))
-		}
-		if key, err = GetPrimaryKeyBytes(primaryKeyValues, primaryKeyBytes); err != nil {
+		// truncate key before every read
+		key = key[:0]
+		if key, err = memcom.AppendPrimaryKeyBytes(key, memcom.NewPrimaryKeyDataValueIterator(batch, int(row), primaryKeyColumns)); err != nil {
 			return err
 		}
-		recordID := RecordID{
+		recordID := memcom.RecordID{
 			BatchID: batchID,
 			Index:   uint32(row),
 		}

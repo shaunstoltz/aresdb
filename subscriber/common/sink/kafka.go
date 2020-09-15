@@ -16,18 +16,22 @@ package sink
 
 import (
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/Shopify/sarama"
 	"github.com/uber-go/tally"
 	"github.com/uber/aresdb/client"
-	"github.com/uber/aresdb/gateway"
+	controllerCli "github.com/uber/aresdb/controller/client"
 	memCom "github.com/uber/aresdb/memstore/common"
 	"github.com/uber/aresdb/subscriber/common/rules"
 	"github.com/uber/aresdb/subscriber/config"
 	"github.com/uber/aresdb/utils"
 	"go.uber.org/zap"
-	"strings"
-	"time"
 )
+
+// default schema refresh interval in seconds
+const defaultSchemaRefreshInterval = 600
 
 type KafkaPublisher struct {
 	sarama.SyncProducer
@@ -40,7 +44,7 @@ type KafkaPublisher struct {
 }
 
 func NewKafkaPublisher(serviceConfig config.ServiceConfig, jobConfig *rules.JobConfig, cluster string,
-	sinkCfg config.SinkConfig, aresControllerClient gateway.ControllerClient) (Sink, error) {
+	sinkCfg config.SinkConfig, aresControllerClient controllerCli.ControllerClient) (Sink, error) {
 	if sinkCfg.GetSinkMode() != config.Sink_Kafka {
 		return nil, fmt.Errorf("Failed to NewKafkaPublisher, wrong sinkMode=%d", sinkCfg.GetSinkMode())
 	}
@@ -49,6 +53,9 @@ func NewKafkaPublisher(serviceConfig config.ServiceConfig, jobConfig *rules.JobC
 	serviceConfig.Logger.Info("Kafka borkers address", zap.Any("brokers", addresses))
 
 	cfg := sarama.NewConfig()
+	if jobConfig.AresTableConfig.Table.IsFactTable {
+		cfg.Producer.Partitioner = sarama.NewManualPartitioner
+	}
 	cfg.Producer.RequiredAcks = sarama.WaitForAll // Wait for all in-sync replicas to ack the message
 	if sinkCfg.KafkaProducerConfig.RetryMax > 0 {
 		cfg.Producer.Retry.Max = sinkCfg.KafkaProducerConfig.RetryMax
@@ -73,7 +80,10 @@ func NewKafkaPublisher(serviceConfig config.ServiceConfig, jobConfig *rules.JobC
 		}), aresControllerClient)
 
 	// schema refresh is based on job assignment refresh, so disable at here
-	err = cachedSchemaHandler.Start(0)
+	if sinkCfg.KafkaProducerConfig.SchemaRefreshInterval <= 0 {
+		sinkCfg.KafkaProducerConfig.SchemaRefreshInterval = defaultSchemaRefreshInterval
+	}
+	cachedSchemaHandler.Start(sinkCfg.KafkaProducerConfig.SchemaRefreshInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +112,7 @@ func NewKafkaPublisher(serviceConfig config.ServiceConfig, jobConfig *rules.JobC
 // Shutdown will clean up resources that needs to be cleaned up
 func (kp *KafkaPublisher) Shutdown() {
 	kp.SyncProducer.Close()
+	kp.UpsertBatchBuilder = nil
 }
 
 // Save saves a batch of row objects into a destination
@@ -116,11 +127,11 @@ func (kp *KafkaPublisher) Save(destination Destination, rows []client.Row) error
 	msgs := make([]*sarama.ProducerMessage, 0, len(shards))
 	if shards == nil {
 		// case1: no sharding --  publish rows to random kafka partition
-		kp.buildKafkaMessage(msgs, &rowsIgnored, destination.Table, -1, destination.ColumnNames, rows, destination.AresUpdateModes...)
+		kp.buildKafkaMessage(&msgs, &rowsIgnored, destination.Table, -1, destination.ColumnNames, rows, destination.AresUpdateModes...)
 	} else {
 		// case2: sharding -- publish rows to specified partition
 		for shardID, rowsInShard := range shards {
-			kp.buildKafkaMessage(msgs, &rowsIgnored, destination.Table, int32(shardID), destination.ColumnNames, rowsInShard, destination.AresUpdateModes...)
+			kp.buildKafkaMessage(&msgs, &rowsIgnored, destination.Table, int32(shardID), destination.ColumnNames, rowsInShard, destination.AresUpdateModes...)
 		}
 	}
 
@@ -146,25 +157,30 @@ func (kp *KafkaPublisher) Cluster() string {
 	return kp.ClusterName
 }
 
-func (kp *KafkaPublisher) buildKafkaMessage(msgs []*sarama.ProducerMessage, rowsIgnored *int, tableName string, shardID int32, columnNames []string, rows []client.Row,
+func (kp *KafkaPublisher) buildKafkaMessage(msgs *[]*sarama.ProducerMessage, rowsIgnored *int, tableName string, shardID int32, columnNames []string, rows []client.Row,
 	updateModes ...memCom.ColumnUpdateMode) {
 	bytes, numRows, err := kp.UpsertBatchBuilder.PrepareUpsertBatch(tableName, columnNames, updateModes, rows)
 	if err != nil {
 		kp.Scope.Counter("errors.upsertBatchBuild").Inc(1)
-		utils.StackError(err, "Failed to prepare rows in table %s, columns: %+v",
-			tableName, columnNames)
+		kp.ServiceConfig.Logger.Error("Failed to prepare rows",
+			zap.String("table", tableName),
+			zap.Any("columns", columnNames),
+			zap.Error(err))
 	}
 
-	msg := sarama.ProducerMessage{
-		Topic: fmt.Sprintf("%s-%s", kp.Cluster(), tableName),
-		Value: sarama.ByteEncoder(bytes),
+	if len(bytes) > 0 {
+		msg := sarama.ProducerMessage{
+			Topic: fmt.Sprintf("ares-redolog-%s-%s", kp.Cluster(), tableName),
+			Value: sarama.ByteEncoder(bytes),
+		}
+
+		if shardID >= 0 {
+			msg.Partition = shardID
+		}
+
+		*msgs = append(*msgs, &msg)
 	}
 
-	if shardID >= 0 {
-		msg.Partition = shardID
-	}
-
-	msgs = append(msgs, &msg)
 	*rowsIgnored = *rowsIgnored + (len(rows) - numRows)
 	return
 }

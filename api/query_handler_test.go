@@ -17,11 +17,14 @@ package api
 import (
 	"bytes"
 	"fmt"
+	"github.com/uber/aresdb/cluster/topology"
+	"github.com/uber/aresdb/query"
+	"github.com/uber/aresdb/utils"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 
-	"github.com/uber/aresdb/memstore"
+	memCom "github.com/uber/aresdb/memstore/common"
 	memMocks "github.com/uber/aresdb/memstore/mocks"
 	metaCom "github.com/uber/aresdb/metastore/common"
 
@@ -31,12 +34,12 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 	"github.com/uber/aresdb/common"
-	"github.com/uber/aresdb/query"
+	queryCom "github.com/uber/aresdb/query/common"
 )
 
 var _ = ginkgo.Describe("QueryHandler", func() {
 	var testServer *httptest.Server
-	var testSchema = memstore.NewTableSchema(&metaCom.Table{
+	var testSchema = memCom.NewTableSchema(&metaCom.Table{
 		Name:        "trips",
 		IsFactTable: false,
 		Columns: []metaCom.Column{
@@ -65,11 +68,15 @@ var _ = ginkgo.Describe("QueryHandler", func() {
 	var memStore *memMocks.MemStore
 	ginkgo.BeforeEach(func() {
 		memStore = CreateMemStore(testSchema, 0, nil, CreateMockDiskStore())
-		queryHandler := NewQueryHandler(memStore, common.QueryConfig{
-			DeviceMemoryUtilization: 1.0,
-		})
+		queryHandler := NewQueryHandler(
+			memStore,
+			topology.NewStaticShardOwner([]int{0}),
+			common.QueryConfig{
+				DeviceMemoryUtilization: 1.0,
+			},
+			10)
 		testRouter := mux.NewRouter()
-		testRouter.HandleFunc("/aql", queryHandler.HandleAQL).Methods(http.MethodGet, http.MethodPost)
+		testRouter.HandleFunc("/aql", utils.ApplyHTTPWrappers(queryHandler.HandleAQL)).Methods(http.MethodGet, http.MethodPost)
 		testServer = httptest.NewUnstartedServer(WithPanicHandling(testRouter))
 		testServer.Start()
 	})
@@ -116,6 +123,48 @@ var _ = ginkgo.Describe("QueryHandler", func() {
 		Ω(string(bs)).Should(MatchJSON(`{
 				"results": [
 				  {}
+				]
+			  }`))
+		Ω(resp.StatusCode).Should(Equal(http.StatusOK))
+
+		query = `
+			{
+			  "queries": [
+				{
+				  "measures": [
+					{
+					  "sqlExpression": "1"
+					}
+				  ],
+				  "rowFilters": [
+					"trips.status!='ACTIVE'"
+				  ],
+				  "table": "trips",
+				  "timeFilter": {
+					"column": "trips.request_at",
+					"from": "-6d"
+				  },
+				  "dimensions": [
+					{
+					  "sqlExpression": "trips.request_at"
+					}
+				  ]
+				}
+			  ]
+			}
+		`
+		resp, err = http.Post(fmt.Sprintf("http://%s/aql", hostPort), "application/json", bytes.NewBuffer([]byte(query)))
+		Ω(err).Should(BeNil())
+		bs, err = ioutil.ReadAll(resp.Body)
+		Ω(err).Should(BeNil())
+		Ω(string(bs)).Should(MatchJSON(`{
+				"results": [
+				  {
+					"headers": [
+						"trips.request_at"
+					],
+					"matrixData": []
+				  }
 				]
 			  }`))
 		Ω(resp.StatusCode).Should(Equal(http.StatusOK))
@@ -202,7 +251,7 @@ var _ = ginkgo.Describe("QueryHandler", func() {
 	})
 
 	ginkgo.It("Report hll result in JsonResponseWriter should work", func() {
-		q := &query.AQLQuery{
+		q := &queryCom.AQLQuery{
 			Table: "trips",
 		}
 
@@ -290,6 +339,39 @@ var _ = ginkgo.Describe("QueryHandler", func() {
 		Ω(err).Should(BeNil())
 		Ω(string(bs)).Should(ContainSubstring("FLOOR"))
 		Ω(string(bs)).Should(ContainSubstring("Unsigned"))
+		Ω(string(bs)).Should(ContainSubstring("allBatches"))
+
+		query = `
+			{
+			  "queries": [
+				{
+				  "measures": [
+					{
+					  "sqlExpression": "1"
+					}
+				  ],
+				  "rowFilters": [
+					"trips.status!='ACTIVE'"
+				  ],
+				  "table": "trips",
+				  "timeFilter": {
+					"column": "trips.request_at",
+					"from": "-6d"
+				  },
+				  "dimensions": [
+					{
+					  "sqlExpression": "trips.request_at"
+					}
+				  ]
+				}
+			  ]
+			}
+		`
+		resp, err = http.Post(fmt.Sprintf("http://%s/aql?verbose=1", hostPort), "application/json", bytes.NewBuffer([]byte(query)))
+		Ω(err).Should(BeNil())
+		bs, err = ioutil.ReadAll(resp.Body)
+		Ω(err).Should(BeNil())
+		Ω(string(bs)).Should(ContainSubstring("mainTableCommonFilters"))
 		Ω(string(bs)).Should(ContainSubstring("allBatches"))
 	})
 })

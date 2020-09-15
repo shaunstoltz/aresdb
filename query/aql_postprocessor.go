@@ -18,62 +18,90 @@ package query
 import "C"
 
 import (
+	"encoding/json"
+	"github.com/uber/aresdb/cgoutils"
 	memCom "github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/memutils"
 	queryCom "github.com/uber/aresdb/query/common"
 	"github.com/uber/aresdb/query/expr"
 	"github.com/uber/aresdb/utils"
 	"unsafe"
 )
 
+var bytesComma = []byte(",")
+
 // Postprocess converts the internal dimension and measure vector in binary
 // format to AQLQueryResult nested result format. It also translates enum
 // values back to their string representations.
-func (qc *AQLQueryContext) Postprocess() queryCom.AQLQueryResult {
+func (qc *AQLQueryContext) Postprocess() {
 	oopkContext := qc.OOPK
 	if oopkContext.IsHLL() {
-		result, err := queryCom.NewTimeSeriesHLLResult(qc.HLLQueryResult, queryCom.HLLDataHeader)
+		// skip translate enum for HLL if query is from broker
+		result, err := queryCom.NewTimeSeriesHLLResult(qc.HLLQueryResult, queryCom.HLLDataHeader, qc.DataOnly)
 		if err != nil {
 			// should never be here except bug
 			qc.Error = utils.StackError(err, "failed to read hll result")
-			return nil
+			return
 		}
-		return queryCom.ComputeHLLResult(result)
+		qc.Results = queryCom.ComputeHLLResult(result)
+		return
 	}
 
-	result := make(queryCom.AQLQueryResult)
-	dimValues := make([]*string, len(oopkContext.Dimensions))
-	dataTypes := make([]memCom.DataType, len(oopkContext.Dimensions))
-	reverseDicts := make(map[int][]string)
-	dimOffsets := make(map[int][2]int)
+	if !qc.IsNonAggregationQuery {
+		qc.flushResultBuffer()
+	}
+}
 
+func (qc *AQLQueryContext) initResultFlushContext() {
+	qc.resultFlushContext.dimensionValueCache = make([]map[queryCom.TimeDimensionMeta]map[int64]string, len(qc.OOPK.Dimensions))
+	qc.resultFlushContext.dimensionDataTypes = make([]memCom.DataType, len(qc.OOPK.Dimensions))
+	qc.resultFlushContext.reverseDicts = make(map[int][]string)
+
+	oopkContext := qc.OOPK
 	for dimIndex, dimExpr := range oopkContext.Dimensions {
-		dimVectorIndex := oopkContext.DimensionVectorIndex[dimIndex]
-		valueOffset, nullOffset := queryCom.GetDimensionStartOffsets(oopkContext.NumDimsPerDimWidth, dimVectorIndex, oopkContext.ResultSize)
-		dimOffsets[dimIndex] = [2]int{valueOffset, nullOffset}
-		dataTypes[dimIndex], reverseDicts[dimIndex] = getDimensionDataType(dimExpr), qc.getEnumReverseDict(dimIndex, dimExpr)
+		qc.resultFlushContext.dimensionDataTypes[dimIndex], qc.resultFlushContext.reverseDicts[dimIndex] = queryCom.GetDimensionDataType(dimExpr), qc.getEnumReverseDict(dimIndex, dimExpr)
 	}
+}
+
+// flushResultBuffer reads dimension and measure data from current OOPK buffer to Results
+func (qc *AQLQueryContext) flushResultBuffer() {
+	start := utils.Now()
+	defer func() { qc.reportTiming(qc.cudaStreams[0], &start, resultFlushTiming) }()
+
+	if qc.Results == nil {
+		qc.Results = make(queryCom.AQLQueryResult)
+	}
+
+	oopkContext := qc.OOPK
+	dpc := qc.resultFlushContext
+	dimValues := make([]*string, len(oopkContext.Dimensions))
 
 	var fromOffset, toOffset int
 	if qc.fromTime != nil && qc.toTime != nil {
 		_, fromOffset = qc.fromTime.Time.Zone()
 		_, toOffset = qc.toTime.Time.Zone()
 	}
-	// caches time formatted time dimension values
-	dimensionValueCache := make([]map[queryCom.TimeDimensionMeta]map[int64]string, len(oopkContext.Dimensions))
+
+	dimOffsets := make(map[int][2]int)
+	for dimIndex := range oopkContext.Dimensions {
+		dimVectorIndex := oopkContext.DimensionVectorIndex[dimIndex]
+		valueOffset, nullOffset := queryCom.GetDimensionStartOffsets(oopkContext.NumDimsPerDimWidth, dimVectorIndex, oopkContext.ResultSize)
+		dimOffsets[dimIndex] = [2]int{valueOffset, nullOffset}
+	}
+
 	for i := 0; i < oopkContext.ResultSize; i++ {
+		dimReadingStart := utils.Now()
 		for dimIndex := range oopkContext.Dimensions {
 			offsets := dimOffsets[dimIndex]
 			valueOffset, nullOffset := offsets[0], offsets[1]
-			valuePtr, nullPtr := memutils.MemAccess(oopkContext.dimensionVectorH, valueOffset), memutils.MemAccess(oopkContext.dimensionVectorH, nullOffset)
+			valuePtr, nullPtr := utils.MemAccess(oopkContext.dimensionVectorH, valueOffset), utils.MemAccess(oopkContext.dimensionVectorH, nullOffset)
 
-			if qc.Query.Dimensions[dimIndex].isTimeDimension() && dimensionValueCache[dimIndex] == nil {
-				dimensionValueCache[dimIndex] = make(map[queryCom.TimeDimensionMeta]map[int64]string)
+			if qc.Query.Dimensions[dimIndex].IsTimeDimension() && dpc.dimensionValueCache[dimIndex] == nil {
+				dpc.dimensionValueCache[dimIndex] = make(map[queryCom.TimeDimensionMeta]map[int64]string)
 			}
 
 			var timeDimensionMeta *queryCom.TimeDimensionMeta
 
-			if qc.Query.Dimensions[dimIndex].isTimeDimension() {
+			if qc.Query.Dimensions[dimIndex].IsTimeDimension() {
 				timeDimensionMeta = &queryCom.TimeDimensionMeta{
 					TimeBucketizer:  qc.Query.Dimensions[dimIndex].TimeBucketizer,
 					TimeUnit:        qc.Query.Dimensions[dimIndex].TimeUnit,
@@ -85,13 +113,36 @@ func (qc *AQLQueryContext) Postprocess() queryCom.AQLQueryResult {
 				}
 			}
 
-			dimValues[dimIndex] = queryCom.ReadDimension(
-				valuePtr, nullPtr, i, dataTypes[dimIndex], reverseDicts[dimIndex],
-				timeDimensionMeta, dimensionValueCache[dimIndex])
-		}
+			// don't translate enum if it's for distributed mode (DataOnly == true)
+			var enumDict []string
+			if !qc.DataOnly {
+				enumDict = dpc.reverseDicts[dimIndex]
+			}
 
-		if qc.isNonAggregationQuery {
-			result.Append(dimValues)
+			dimValues[dimIndex] = queryCom.ReadDimension(
+				valuePtr, nullPtr, i, dpc.dimensionDataTypes[dimIndex], enumDict,
+				timeDimensionMeta, dpc.dimensionValueCache[dimIndex])
+		}
+		utils.GetRootReporter().GetTimer(utils.QueryDimReadLatency).Record(utils.Now().Sub(dimReadingStart))
+
+		if qc.IsNonAggregationQuery {
+			if qc.ResponseWriter != nil {
+				nullStr := queryCom.NULLString
+				for i, dimVal := range dimValues {
+					if dimVal == nil {
+						dimValues[i] = &nullStr
+					}
+				}
+				valuesBytes, _ := json.Marshal(dimValues)
+				if qc.resultFlushContext.rowsFlushed > 0 {
+					qc.ResponseWriter.Write(bytesComma)
+				}
+				qc.ResponseWriter.Write(valuesBytes)
+				qc.resultFlushContext.rowsFlushed++
+			} else {
+				qc.Results.Append(dimValues)
+			}
+
 		} else {
 			measureBytes := oopkContext.MeasureBytes
 
@@ -101,21 +152,12 @@ func (qc *AQLQueryContext) Postprocess() queryCom.AQLQueryResult {
 			}
 
 			measureValue := readMeasure(
-				memutils.MemAccess(oopkContext.measureVectorH, i*oopkContext.MeasureBytes), oopkContext.Measure,
+				utils.MemAccess(oopkContext.measureVectorH, i*oopkContext.MeasureBytes), oopkContext.Measure,
 				measureBytes)
 
-			result.Set(dimValues, measureValue)
+			qc.Results.Set(dimValues, measureValue)
 		}
 	}
-
-	if qc.isNonAggregationQuery {
-		headers := make([]string, len(qc.Query.Dimensions))
-		for i, dim := range qc.Query.Dimensions {
-			headers[i] = dim.Expr
-		}
-		result.SetHeaders(headers)
-	}
-	return result
 }
 
 // PostprocessAsHLLData serializes the query result into HLLData format. It will also release the device memory after
@@ -131,8 +173,8 @@ func (qc *AQLQueryContext) PostprocessAsHLLData() ([]byte, error) {
 
 	var timeDimensions []int
 	for dimIndex, ast := range oopkContext.Dimensions {
-		dataTypes[dimIndex], reverseDicts[dimIndex] = getDimensionDataType(ast), qc.getEnumReverseDict(dimIndex, ast)
-		if qc.Query.Dimensions[dimIndex].isTimeDimension() {
+		dataTypes[dimIndex], reverseDicts[dimIndex] = queryCom.GetDimensionDataType(ast), qc.getEnumReverseDict(dimIndex, ast)
+		if qc.Query.Dimensions[dimIndex].IsTimeDimension() {
 			timeDimensions = append(timeDimensions, dimIndex)
 		}
 	}
@@ -144,8 +186,14 @@ func (qc *AQLQueryContext) PostprocessAsHLLData() ([]byte, error) {
 // a nil slice.
 func (qc *AQLQueryContext) getEnumReverseDict(dimIndex int, expression expr.Expr) []string {
 	varRef, ok := expression.(*expr.VarRef)
-	if ok && (varRef.DataType == memCom.SmallEnum || varRef.DataType == memCom.BigEnum) {
+	if ok && memCom.IsEnumType(varRef.DataType) {
 		return varRef.EnumReverseDict
+	}
+	// special handling element_at for array enum type
+	if binExpr, ok := expression.(*expr.BinaryExpr); ok && binExpr.Op == expr.ARRAY_ELEMENT_AT {
+		if vr, ok := binExpr.LHS.(*expr.VarRef); ok && memCom.IsEnumType(vr.DataType) {
+			return vr.EnumReverseDict
+		}
 	}
 
 	// return validShapeUUIDs as the reverse enum dict if dimIndex match geo dimension
@@ -159,10 +207,10 @@ func (qc *AQLQueryContext) getEnumReverseDict(dimIndex int, expression expr.Expr
 // ReleaseHostResultsBuffers deletes the result buffer from host memory after postprocessing
 func (qc *AQLQueryContext) ReleaseHostResultsBuffers() {
 	ctx := &qc.OOPK
-	memutils.HostFree(ctx.dimensionVectorH)
+	cgoutils.HostFree(ctx.dimensionVectorH)
 	ctx.dimensionVectorH = nil
 	if ctx.measureVectorH != nil {
-		memutils.HostFree(ctx.measureVectorH)
+		cgoutils.HostFree(ctx.measureVectorH)
 		ctx.measureVectorH = nil
 	}
 
@@ -172,6 +220,13 @@ func (qc *AQLQueryContext) ReleaseHostResultsBuffers() {
 
 	// set geoIntersection to nil
 	qc.OOPK.geoIntersection = nil
+}
+
+func (qc *AQLQueryContext) ResultsRowsFlushed() int {
+	if qc.IsNonAggregationQuery {
+		return qc.resultFlushContext.rowsFlushed
+	}
+	return qc.OOPK.ResultSize
 }
 
 func readMeasure(measureRow unsafe.Pointer, ast expr.Expr, measureBytes int) *float64 {

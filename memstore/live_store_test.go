@@ -21,19 +21,20 @@ import (
 )
 
 var _ = ginkgo.Describe("live store", func() {
-	m := getFactory().NewMockMemStore()
+	m := GetFactory().NewMockMemStore()
 	mockDiskStore := CreateMockDiskStore()
 	hostMemoryManager := NewHostMemoryManager(m, 1<<32)
 	ginkgo.It("provides batches for reads and writes", func() {
 		shard := &TableShard{
-			Schema: &TableSchema{
+			Schema: &common.TableSchema{
 				ValueTypeByColumn: []common.DataType{common.Uint32, common.Uint16, common.Uint8},
 				DefaultValues:     []*common.DataValue{&common.NullDataValue, &common.NullDataValue, &common.NullDataValue},
 			},
 			diskStore:         mockDiskStore,
 			HostMemoryManager: hostMemoryManager,
+			options:           m.options,
 		}
-		vs := NewLiveStore(0, shard)
+		vs := NewLiveStore(0, 1, shard)
 
 		Ω(vs.LastReadRecord.BatchID).Should(Equal(BaseBatchID))
 		Ω(vs.LastReadRecord.Index).Should(Equal(uint32(0)))
@@ -55,14 +56,16 @@ var _ = ginkgo.Describe("live store", func() {
 
 	ginkgo.It("provides live batches for reads and appends", func() {
 		shard := &TableShard{
-			Schema: &TableSchema{
+			Schema: &common.TableSchema{
 				ValueTypeByColumn: []common.DataType{common.Uint32, common.Uint16, common.Uint8},
 				DefaultValues:     []*common.DataValue{&common.NullDataValue, &common.NullDataValue, &common.NullDataValue},
 			},
 			diskStore:         mockDiskStore,
 			HostMemoryManager: hostMemoryManager,
+			options:           m.options,
 		}
-		vs := NewLiveStore(16, shard)
+		m.options.redoLogMaster.Stop()
+		vs := NewLiveStore(16, 1, shard)
 
 		vs.appendBatch(BaseBatchID)
 		b := vs.GetBatchForRead(BaseBatchID)
@@ -99,15 +102,17 @@ var _ = ginkgo.Describe("live store", func() {
 
 	ginkgo.It("provides live vectorparty for reads and writes", func() {
 		shard := &TableShard{
-			Schema: &TableSchema{
+			Schema: &common.TableSchema{
 				ValueTypeByColumn: []common.DataType{common.Uint32, common.Uint16, common.Uint8, common.Uint8, common.Uint8, common.Bool},
 				DefaultValues: []*common.DataValue{&common.NullDataValue, &common.NullDataValue, &common.NullDataValue, &common.NullDataValue,
 					&common.NullDataValue, &common.NullDataValue},
 			},
 			diskStore:         mockDiskStore,
 			HostMemoryManager: hostMemoryManager,
+			options:           m.options,
 		}
-		vs := NewLiveStore(0, shard)
+		m.options.redoLogMaster.Stop()
+		vs := NewLiveStore(0, 1, shard)
 
 		vs.appendBatch(BaseBatchID)
 		b := vs.GetBatchForRead(BaseBatchID)
@@ -142,14 +147,16 @@ var _ = ginkgo.Describe("live store", func() {
 
 	ginkgo.It("get batch ids skips batches that are beyond last read batch", func() {
 		shard := &TableShard{
-			Schema: &TableSchema{
+			Schema: &common.TableSchema{
 				ValueTypeByColumn: []common.DataType{common.Uint32, common.Uint16, common.Uint8, common.Uint8, common.Uint8, common.Bool},
 				DefaultValues:     []*common.DataValue{&common.NullDataValue, &common.NullDataValue, &common.NullDataValue, &common.NullDataValue, &common.NullDataValue, &common.NullDataValue},
 			},
 			diskStore:         mockDiskStore,
 			HostMemoryManager: hostMemoryManager,
+			options:           m.options,
 		}
-		vs := NewLiveStore(16, shard)
+		m.options.redoLogMaster.Stop()
+		vs := NewLiveStore(16, 1, shard)
 
 		vs.appendBatch(BaseBatchID)
 		vs.appendBatch(BaseBatchID + 1)
@@ -177,18 +184,20 @@ var _ = ginkgo.Describe("live store", func() {
 		keyBytes := 21
 		pk := NewPrimaryKey(keyBytes, true, 10, hostMemoryManager)
 		shard := &TableShard{
-			Schema: &TableSchema{
+			Schema: &common.TableSchema{
 				PrimaryKeyBytes:       keyBytes,
 				PrimaryKeyColumnTypes: primaryKeyDataTypes,
 			},
 			diskStore:         mockDiskStore,
 			HostMemoryManager: hostMemoryManager,
+			options:           m.options,
 		}
-		vs := NewLiveStore(0, shard)
+		m.options.redoLogMaster.Stop()
+		vs := NewLiveStore(0, 1, shard)
 		vs.PrimaryKey = pk
 
 		key := []byte{1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1}
-		recordID := RecordID{1, 1}
+		recordID := common.RecordID{BatchID: 1, Index: 1}
 
 		pk.FindOrInsert(key, recordID, 1)
 		r, found := vs.LookupKey([]string{"01000000000000000100000000000000", "1", "true"})
@@ -199,15 +208,17 @@ var _ = ginkgo.Describe("live store", func() {
 
 	ginkgo.It("get or create batch for snapshot", func() {
 		shard := &TableShard{
-			Schema: &TableSchema{
+			Schema: &common.TableSchema{
 				ValueTypeByColumn: []common.DataType{common.Uint32, common.Uint16, common.Uint8, common.Uint8, common.Uint8, common.Bool},
 				DefaultValues: []*common.DataValue{&common.NullDataValue, &common.NullDataValue, &common.NullDataValue, &common.NullDataValue,
 					&common.NullDataValue, &common.NullDataValue},
 			},
 			diskStore:         mockDiskStore,
 			HostMemoryManager: hostMemoryManager,
+			options:           m.options,
 		}
-		vs := NewLiveStore(0, shard)
+		m.options.redoLogMaster.Stop()
+		vs := NewLiveStore(0, 1, shard)
 		liveBatch1 := vs.getOrCreateBatch(-1)
 		Ω(liveBatch1).ShouldNot(BeNil())
 		liveBatch1.Unlock()

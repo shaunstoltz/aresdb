@@ -22,7 +22,8 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/uber-go/tally"
 	"github.com/uber/aresdb/common"
-	"github.com/uber/aresdb/memstore"
+	memCom "github.com/uber/aresdb/memstore/common"
+	queryCom "github.com/uber/aresdb/query/common"
 	"github.com/uber/aresdb/query/expr"
 	"github.com/uber/aresdb/utils"
 )
@@ -30,16 +31,16 @@ import (
 var _ = ginkgo.Describe("Time Bucketizer", func() {
 	var qc *AQLQueryContext
 	ginkgo.BeforeEach(func() {
-		q := &AQLQuery{
+		q := &queryCom.AQLQuery{
 			Table: "trips",
-			Measures: []Measure{
+			Measures: []queryCom.Measure{
 				{Expr: "count()"},
 			},
-			TimeFilter: TimeFilter{
+			TimeFilter: queryCom.TimeFilter{
 				From: "-1d",
 				To:   "0d",
 			},
-			Dimensions: []Dimension{Dimension{Expr: "requested_at", TimeBucketizer: "hour"}},
+			Dimensions: []queryCom.Dimension{{Expr: "requested_at", TimeBucketizer: "hour"}},
 		}
 		qc = &AQLQueryContext{
 			Query: q,
@@ -103,7 +104,7 @@ var _ = ginkgo.Describe("Time Bucketizer", func() {
 		qc.timezoneTable.tableColumn = "timezone"
 		qc.timezoneTable.tableAlias = defaultTimezoneTableAlias
 		qc.TableIDByAlias = map[string]int{defaultTimezoneTableAlias: 0}
-		qc.TableScanners = []*TableScanner{{Schema: &memstore.TableSchema{ColumnIDs: map[string]int{"timezone": 1}}}}
+		qc.TableScanners = []*TableScanner{{Schema: &memCom.TableSchema{ColumnIDs: map[string]int{"timezone": 1}}}}
 		exp, err = qc.buildTimeDimensionExpr("week", timeColumn)
 		Ω(exp).ShouldNot(BeNil())
 		Ω(exp.String()).Should(Equal("GET_WEEK_START(request_at CONVERT_TZ __timezone_lookup.timezone)"))
@@ -111,8 +112,8 @@ var _ = ginkgo.Describe("Time Bucketizer", func() {
 
 		qc.timezoneTable.tableColumn = ""
 		qc.fixedTimezone = time.FixedZone("Foo", 2018)
-		qc.fromTime = &alignedTime{Time: utils.Now().In(qc.fixedTimezone)}
-		qc.toTime = &alignedTime{Time: utils.Now().In(qc.fixedTimezone)}
+		qc.fromTime = &queryCom.AlignedTime{Time: utils.Now().In(qc.fixedTimezone)}
+		qc.toTime = &queryCom.AlignedTime{Time: utils.Now().In(qc.fixedTimezone)}
 		exp, err = qc.buildTimeDimensionExpr("week", timeColumn)
 		Ω(exp).ShouldNot(BeNil())
 		Ω(exp.String()).Should(Equal("GET_WEEK_START(request_at CONVERT_TZ 2018)"))
@@ -225,9 +226,9 @@ var _ = ginkgo.Describe("Time Bucketizer", func() {
 	})
 
 	ginkgo.It("parses query with TimeSeriesBucketizer", func() {
-		goodQuery := &AQLQuery{
+		goodQuery := &queryCom.AQLQuery{
 			Table: "trips",
-			Dimensions: []Dimension{
+			Dimensions: []queryCom.Dimension{
 				{
 					Expr:           "request_at",
 					TimeBucketizer: "quarter-hour",
@@ -239,9 +240,9 @@ var _ = ginkgo.Describe("Time Bucketizer", func() {
 		Ω(qc.Error).Should(BeNil())
 
 		// missing time column
-		badQuery := &AQLQuery{
+		badQuery := &queryCom.AQLQuery{
 			Table: "trips",
-			Dimensions: []Dimension{
+			Dimensions: []queryCom.Dimension{
 				{
 					TimeBucketizer: "quarter-hour",
 				},
@@ -254,16 +255,16 @@ var _ = ginkgo.Describe("Time Bucketizer", func() {
 
 	ginkgo.It("fixed timezone across DST switch timestamp", func() {
 		qc = &AQLQueryContext{
-			Query: &AQLQuery{
+			Query: &queryCom.AQLQuery{
 				Table: "trips",
-				Measures: []Measure{
+				Measures: []queryCom.Measure{
 					{Expr: "count()"},
 				},
-				TimeFilter: TimeFilter{
+				TimeFilter: queryCom.TimeFilter{
 					From: "1509772380",
 					To:   "1509882360",
 				},
-				Dimensions: []Dimension{Dimension{Expr: "requested_at", TimeBucketizer: "hour"}},
+				Dimensions: []queryCom.Dimension{{Expr: "requested_at", TimeBucketizer: "hour"}},
 				Timezone:   "America/Los_Angeles",
 			},
 		}
@@ -274,7 +275,7 @@ var _ = ginkgo.Describe("Time Bucketizer", func() {
 		Ω(qc.fromTime).ShouldNot(BeNil())
 		Ω(qc.toTime).ShouldNot(BeNil())
 		Ω(qc.fixedTimezone.String()).Should(Equal("America/Los_Angeles"))
-		bb, _ := json.Marshal(qc.Query.Dimensions[0].expr)
+		bb, _ := json.Marshal(qc.Query.Dimensions[0].ExprParsed)
 		Ω(string(bb)).Should(MatchJSON(
 			`
 		{

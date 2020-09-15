@@ -17,6 +17,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/m3db/m3/src/cluster/client/etcd"
@@ -47,6 +48,17 @@ var (
 			NewServiceConfig,
 		),
 	)
+
+	// SinkIsAresDB is a flag. It is true if sink is aresDB
+	SinkIsAresDB = false
+	sinkModeStr  = map[string]SinkMode{
+		"undefined": Sink_Undefined,
+		"aresDB":    Sink_AresDB,
+		"kafka":     Sink_Kafka,
+	}
+
+	// EtcdCfgEvent is used to detect etcd cluster changes
+	EtcdCfgEvent = make(chan int, 1)
 )
 
 // Params defines the base objects for a service.
@@ -81,7 +93,8 @@ type ServiceConfig struct {
 	ActiveJobs         []string              `yaml:"-"`
 	ControllerConfig   *ControllerConfig     `yaml:"controller"`
 	ZooKeeperConfig    ZooKeeperConfig       `yaml:"zookeeper"`
-	EtcdConfig         *etcd.Configuration   `yaml:"etcd"`
+	EtcdConfig         EtcdConfig            `yaml:"etcd"`
+	EtcdClustersConfig []EtcdClusterConfig   `yaml:"etcd.etcdClusters"`
 	HeartbeatConfig    *HeartBeatConfig      `yaml:"heartbeat"`
 }
 
@@ -93,6 +106,17 @@ type HeartBeatConfig struct {
 	CheckInterval int  `yaml:"checkInterval"`
 }
 
+type EtcdConfig struct {
+	*sync.Mutex
+
+	EtcdConfig etcd.Configuration `yaml:",inline"`
+}
+
+type EtcdClusterConfig struct {
+	EtcdCluster etcd.ClusterConfig `yaml:",inline"`
+	UNS         string             `yaml:"uns"`
+}
+
 // SinkMode defines the subscriber sink mode
 type SinkMode int
 
@@ -102,31 +126,29 @@ const (
 	Sink_Kafka
 )
 
-var sinkModeStr = map[string]SinkMode{
-	"undefined": Sink_Undefined,
-	"aresDB":    Sink_AresDB,
-	"kafka":     Sink_Kafka,
-}
-
 // SinkConfig wraps sink configurations
 type SinkConfig struct {
 	// SinkMode defines the subscriber sink mode
-	SinkModeStr string `yaml:"sinkMode"`
+	SinkModeStr string `yaml:"sinkMode" json:"sinkMode"`
 	// AresDBConnectorConfig defines aresDB client config
-	AresDBConnectorConfig client.ConnectorConfig `yaml:"aresDB"`
+	AresDBConnectorConfig client.ConnectorConfig `yaml:"aresDB" json:"aresDB"`
 	// KafkaProducerConfig defines Kafka producer config
-	KafkaProducerConfig KafkaProducerConfig `yaml:"kafkaProducer"`
+	KafkaProducerConfig KafkaProducerConfig `yaml:"kafkaProducer" json:"kafkaProducer"`
 }
 
 // KafkaProducerConfig represents Kafka producer configuration
 type KafkaProducerConfig struct {
 	// Brokers defines a list of broker addresses separated by comma
-	Brokers string `yaml:"brokers"`
+	Brokers string `yaml:"brokers" json:"brokers"`
 	// RetryMax is the max number of times to retry sending a message (default 3).
-	RetryMax int `yaml:"retryMax"`
+	RetryMax int `yaml:"retryMax" json:"retryMax"`
 	// TimeoutInMSec is the max duration the broker will wait
 	// the receipt of the number of RequiredAcks (defaults to 10 seconds)
-	TimeoutInSec int `yaml:"timeoutInSec"`
+	TimeoutInSec int `yaml:"timeoutInSec" json:"timeoutInSec"`
+	// SchemaRefreshInterval is the interval in seconds for the connector to
+	// fetch and refresh schema from ares
+	// if <= 0, will use default
+	SchemaRefreshInterval int `yaml:"schemaRefreshInterval" json:"schemaRefreshInterval"`
 }
 
 // AresNSConfig defines the mapping b/w ares namespace and its clusters
@@ -175,6 +197,19 @@ func NewServiceConfig(p Params) (Result, error) {
 			ServiceConfig: serviceConfig,
 		}, err
 	}
+
+	raw = p.Config.Get("etcd.etcdClusters")
+	if err := raw.Populate(&serviceConfig.EtcdClustersConfig); err != nil {
+		return Result{
+			ServiceConfig: serviceConfig,
+		}, err
+	}
+
+	// etcd key format: prefix/${env}/namespace/service/instanceId
+	etcdConfig := &serviceConfig.EtcdConfig
+	etcdConfig.Mutex = &sync.Mutex{}
+	etcdConfig.EtcdConfig.Env = fmt.Sprintf("%s/%s", etcdConfig.EtcdConfig.Env, ActiveJobNameSpace)
+
 	serviceConfig.Environment = p.Environment
 	serviceConfig.Logger = p.Logger
 	serviceConfig.Scope = p.Scope.Tagged(map[string]string{
@@ -185,15 +220,9 @@ func NewServiceConfig(p Params) (Result, error) {
 	serviceConfig.Config = p.Config
 	serviceConfig.ActiveAresClusters = make(map[string]SinkConfig)
 
-	// Skip local job and aresCluster config if controller is enabled
-	if serviceConfig.ControllerConfig.Enable {
-		return Result{
-			ServiceConfig: serviceConfig,
-		}, nil
-	}
-
 	// set serviceConfig.ActiveAresClusters
-	if serviceConfig.AresNSConfig.AresClusters == nil || serviceConfig.AresNSConfig.AresNameSpaces == nil {
+	if (serviceConfig.AresNSConfig.AresClusters == nil || serviceConfig.AresNSConfig.AresNameSpaces == nil) &&
+		!serviceConfig.ControllerConfig.Enable {
 		return Result{
 			ServiceConfig: serviceConfig,
 		}, errors.New("Ares namespaces and clusters must be configured")
@@ -209,14 +238,14 @@ func NewServiceConfig(p Params) (Result, error) {
 				ServiceConfig: serviceConfig,
 			}, fmt.Errorf("No ares cluster configure is found for namespace %s", ActiveAresNameSpace)
 		}
-	} else {
+	} else if !serviceConfig.ControllerConfig.Enable {
 		return Result{
 			ServiceConfig: serviceConfig,
 		}, fmt.Errorf("No ares clusters are defined for namespace %s", ActiveAresNameSpace)
 	}
 
 	// set serviceConfig.ActiveJobs
-	if serviceConfig.JobNSConfig.Jobs == nil {
+	if serviceConfig.JobNSConfig.Jobs == nil && !serviceConfig.ControllerConfig.Enable {
 		return Result{
 			ServiceConfig: serviceConfig,
 		}, errors.New("Job namespace config not found")

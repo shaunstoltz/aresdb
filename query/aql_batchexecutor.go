@@ -16,7 +16,7 @@ package query
 
 import (
 	"fmt"
-	"github.com/uber/aresdb/memutils"
+	"github.com/uber/aresdb/cgoutils"
 	queryCom "github.com/uber/aresdb/query/common"
 	"time"
 	"unsafe"
@@ -77,14 +77,15 @@ type BatchExecutorImpl struct {
 }
 
 // NewBatchExecutor is to create a BatchExecutor.
-func NewBatchExecutor(qc *AQLQueryContext, batchID int32, customFilterFunc customFilterExecutor, stream unsafe.Pointer) BatchExecutor {
-	if qc.isNonAggregationQuery {
+func NewBatchExecutor(qc *AQLQueryContext, batchID int32, customFilterFunc customFilterExecutor, stream unsafe.Pointer, start time.Time) BatchExecutor {
+	if qc.IsNonAggregationQuery {
 		return &NonAggrBatchExecutorImpl{
 			BatchExecutorImpl: &BatchExecutorImpl{
 				qc:               qc,
 				batchID:          batchID,
 				customFilterFunc: customFilterFunc,
 				stream:           stream,
+				start:            start,
 			},
 		}
 	}
@@ -94,6 +95,7 @@ func NewBatchExecutor(qc *AQLQueryContext, batchID int32, customFilterFunc custo
 		batchID:          batchID,
 		customFilterFunc: customFilterFunc,
 		stream:           stream,
+		start:            start,
 	}
 }
 
@@ -198,7 +200,9 @@ func (e *BatchExecutorImpl) evalDimensions(prevResultSize int) {
 // project is to generate dimension and measure values
 func (e *BatchExecutorImpl) project() {
 	// Prepare for dimension and measure evaluation.
-	e.qc.OOPK.currentBatch.prepareForDimAndMeasureEval(e.qc.OOPK.DimRowBytes, e.qc.OOPK.MeasureBytes, e.qc.OOPK.NumDimsPerDimWidth, e.qc.OOPK.IsHLL(), e.stream)
+	e.qc.OOPK.currentBatch.prepareForDimAndMeasureEval(
+		e.qc.OOPK.DimRowBytes, e.qc.OOPK.MeasureBytes, e.qc.OOPK.NumDimsPerDimWidth, e.qc.OOPK.IsHLL(),
+		e.qc.OOPK.UseHashReduction(), e.stream)
 
 	e.qc.reportTimingForCurrentBatch(e.stream, &e.start, prepareForDimAndMeasureTiming)
 
@@ -207,7 +211,7 @@ func (e *BatchExecutorImpl) project() {
 	e.evalMeasures()
 
 	// wait for stream to clean up non used buffer before final aggregation
-	memutils.WaitForCudaStream(e.stream, e.qc.Device)
+	cgoutils.WaitForCudaStream(e.stream, e.qc.Device)
 	e.qc.OOPK.currentBatch.cleanupBeforeAggregation()
 }
 
@@ -217,7 +221,7 @@ func (e *BatchExecutorImpl) reduce() {
 	if e.qc.OOPK.IsHLL() {
 		initIndexVector(e.qc.OOPK.currentBatch.dimIndexVectorD[0].getPointer(), 0, e.qc.OOPK.currentBatch.resultSize, e.stream, e.qc.Device)
 		initIndexVector(e.qc.OOPK.currentBatch.dimIndexVectorD[1].getPointer(), e.qc.OOPK.currentBatch.resultSize, e.qc.OOPK.currentBatch.resultSize+e.qc.OOPK.currentBatch.size, e.stream, e.qc.Device)
-	} else {
+	} else if !e.qc.OOPK.UseHashReduction() {
 		initIndexVector(e.qc.OOPK.currentBatch.dimIndexVectorD[0].getPointer(), 0, e.qc.OOPK.currentBatch.resultSize+e.qc.OOPK.currentBatch.size, e.stream, e.qc.Device)
 	}
 
@@ -227,6 +231,12 @@ func (e *BatchExecutorImpl) reduce() {
 				e.qc.OOPK.currentBatch.hll(e.qc.OOPK.NumDimsPerDimWidth, e.isLastBatch, e.stream, e.qc.Device)
 			e.qc.reportTimingForCurrentBatch(e.stream, &e.start, hllEvalTiming)
 		}, "hll", e.stream)
+	} else if e.qc.OOPK.UseHashReduction() {
+		e.qc.doProfile(func() {
+			e.qc.OOPK.currentBatch.hashReduce(
+				e.qc.OOPK.NumDimsPerDimWidth, e.qc.OOPK.MeasureBytes, e.qc.OOPK.AggregateType, e.stream, e.qc.Device)
+			e.qc.reportTimingForCurrentBatch(e.stream, &e.start, hashReduceEvalTiming)
+		}, "hash_reduce", e.stream)
 	} else {
 		// sort by key.
 		e.qc.doProfile(func() {
@@ -240,7 +250,7 @@ func (e *BatchExecutorImpl) reduce() {
 			e.qc.reportTimingForCurrentBatch(e.stream, &e.start, reduceEvalTiming)
 		}, "reduce", e.stream)
 	}
-	memutils.WaitForCudaStream(e.stream, e.qc.Device)
+	cgoutils.WaitForCudaStream(e.stream, e.qc.Device)
 }
 
 func (e *BatchExecutorImpl) preExec(isLastBatch bool, start time.Time) {

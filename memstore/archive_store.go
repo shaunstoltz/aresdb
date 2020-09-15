@@ -21,12 +21,13 @@ import (
 	"strconv"
 
 	"github.com/uber/aresdb/memstore/common"
+	"github.com/uber/aresdb/memstore/list"
 	"github.com/uber/aresdb/utils"
 )
 
 // ArchiveBatch represents a archive batch.
 type ArchiveBatch struct {
-	Batch
+	common.Batch
 
 	// Size of the batch (number of rows). Notice that compression changes the
 	// length of some columns, does not change the size of the batch.
@@ -144,7 +145,7 @@ func (v *ArchiveStoreVersion) RequestBatch(batchID int32) *ArchiveBatch {
 		Size:    size,
 		BatchID: batchID,
 		Shard:   v.shard,
-		Batch:   Batch{RWMutex: &sync.RWMutex{}},
+		Batch:   common.Batch{RWMutex: &sync.RWMutex{}},
 	}
 	v.Batches[batchID] = batch
 	return batch
@@ -154,7 +155,7 @@ func (v *ArchiveStoreVersion) RequestBatch(batchID int32) *ArchiveBatch {
 // stage for merged archive batch so there is no need to lock it.
 func (b *ArchiveBatch) WriteToDisk() error {
 	for columnID, column := range b.Columns {
-		serializer := NewVectorPartyArchiveSerializer(
+		serializer := common.NewVectorPartyArchiveSerializer(
 			b.Shard.HostMemoryManager, b.Shard.diskStore, b.Shard.Schema.Schema.Name, b.Shard.ShardID, columnID, int(b.BatchID), b.Version, b.SeqNum)
 		if err := serializer.WriteVectorParty(column); err != nil {
 			return err
@@ -219,7 +220,11 @@ func (b *ArchiveBatch) RequestVectorParty(columnID int) common.ArchiveVectorPart
 	// columnID should always be smaller than len(ValueTypeByColumn).
 	dataType := b.Shard.Schema.ValueTypeByColumn[columnID]
 	defaultValue := b.Shard.Schema.DefaultValues[columnID]
-	vp = newArchiveVectorParty(b.Size, dataType, *defaultValue, b.RWMutex)
+	if common.IsArrayType(dataType) {
+		vp = list.NewArchiveVectorParty(b.Size, dataType, 0, b.RWMutex)
+	} else {
+		vp = newArchiveVectorParty(b.Size, dataType, *defaultValue, b.RWMutex)
+	}
 	b.Columns[columnID] = vp
 
 	archiveVP := vp.(common.ArchiveVectorParty)
@@ -295,12 +300,12 @@ func (b *ArchiveBatch) MarshalJSON() ([]byte, error) {
 
 // BuildIndex builds an index over the primary key columns of this archive batch and inserts the records id into the
 // given primary key.
-func (b *ArchiveBatch) BuildIndex(sortColumns []int, primaryKeyColumns []int, pk PrimaryKey) error {
+func (b *ArchiveBatch) BuildIndex(sortColumns []int, primaryKeyColumns []int, pk common.PrimaryKey) error {
 	if b == nil {
 		return nil
 	}
 
-	var key []byte
+	key := make([]byte, b.Shard.Schema.PrimaryKeyBytes)
 	var err error
 	primaryKeyValues := make([]common.DataValue, len(primaryKeyColumns))
 
@@ -336,11 +341,13 @@ func (b *ArchiveBatch) BuildIndex(sortColumns []int, primaryKeyColumns []int, pk
 		}
 
 		// Get primary key for each record.
-		if key, err = GetPrimaryKeyBytes(primaryKeyValues, b.Shard.Schema.PrimaryKeyBytes); err != nil {
+		// truncate key
+		key = key[:0]
+		if key, err = common.AppendPrimaryKeyBytes(key, common.NewSliceDataValueIterator(primaryKeyValues)); err != nil {
 			return err
 		}
 
-		existing, _, err := pk.FindOrInsert(key, RecordID{BatchID: b.BatchID, Index: uint32(row)}, 0)
+		existing, _, err := pk.FindOrInsert(key, common.RecordID{BatchID: b.BatchID, Index: uint32(row)}, 0)
 
 		if err != nil {
 			return err
@@ -375,7 +382,7 @@ func (b *ArchiveBatch) BuildIndex(sortColumns []int, primaryKeyColumns []int, pk
 // for holding the lock (if necessary).
 func (b *ArchiveBatch) Clone() *ArchiveBatch {
 	newBatch := &ArchiveBatch{
-		Batch: Batch{
+		Batch: common.Batch{
 			RWMutex: b.Batch.RWMutex,
 			Columns: make([]common.VectorParty, len(b.Columns)),
 		},

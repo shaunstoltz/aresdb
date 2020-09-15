@@ -23,9 +23,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 
-	"github.com/uber/aresdb/memstore"
+	memCom "github.com/uber/aresdb/memstore/common"
 	memMocks "github.com/uber/aresdb/memstore/mocks"
 	metaCom "github.com/uber/aresdb/metastore/common"
+
 	"github.com/uber/aresdb/metastore/mocks"
 
 	"github.com/gorilla/mux"
@@ -47,8 +48,8 @@ var _ = ginkgo.Describe("EnumHandler", func() {
 			},
 		},
 	}
-	var testTableSchema = memstore.TableSchema{
-		EnumDicts: map[string]memstore.EnumDict{
+	var testTableSchema = memCom.TableSchema{
+		EnumDicts: map[string]memCom.EnumDict{
 			"testColumn": {
 				ReverseDict: []string{"a", "b", "c"},
 				Dict: map[string]int{
@@ -83,8 +84,9 @@ var _ = ginkgo.Describe("EnumHandler", func() {
 		Ω(resp.StatusCode).Should(Equal(http.StatusOK))
 		respBody, err := ioutil.ReadAll(resp.Body)
 		Ω(err).Should(BeNil())
-		enumCases := []string{}
-		json.Unmarshal(respBody, &enumCases)
+		var enumCases []string
+		err = json.Unmarshal(respBody, &enumCases)
+		Ω(err).Should(BeNil())
 		Ω(enumCases).Should(Equal([]string{"a", "b", "c"}))
 
 		resp, _ = http.Get(fmt.Sprintf("http://%s/schema/tables/%s/columns/%s/enum-cases", hostPort, "unknown", "testColumn"))

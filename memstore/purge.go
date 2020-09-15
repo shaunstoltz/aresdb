@@ -21,6 +21,14 @@ import (
 
 // Purge purges out of retention data for table shard
 func (m *memStoreImpl) Purge(tableName string, shardID, batchIDStart, batchIDEnd int, reporter PurgeJobDetailReporter) error {
+	// check if there is peer bootstraping job running, skip this purge if we can not acquire the token
+	if m.options.bootstrapToken.AcquireToken(tableName, uint32(shardID)) {
+		defer m.options.bootstrapToken.ReleaseToken(tableName, uint32(shardID))
+	} else {
+		utils.GetLogger().With("table", tableName, "shard", shardID).Error("Purge failed, unable to acquire bootstrap token, retry later")
+		return nil
+	}
+
 	start := utils.Now()
 	jobKey := getIdentifier(tableName, shardID, memCom.PurgeJobType)
 	purgeTimer := utils.GetReporter(tableName, shardID).GetTimer(utils.PurgeTimingTotal)
@@ -30,11 +38,14 @@ func (m *memStoreImpl) Purge(tableName string, shardID, batchIDStart, batchIDEnd
 		reporter(jobKey, func(status *PurgeJobDetail) {
 			status.LastDuration = duration
 		})
+		utils.GetReporter(tableName, shardID).
+			GetCounter(utils.PurgeCount).Inc(1)
 	}()
 
 	shard, err := m.GetTableShard(tableName, shardID)
 	if err != nil {
-		return err
+		utils.GetLogger().With("table", tableName, "shard", shardID, "error", err).Warn("Failed to find shard, is it deleted?")
+		return nil
 	}
 	defer shard.Users.Done()
 

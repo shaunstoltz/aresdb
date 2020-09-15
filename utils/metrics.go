@@ -26,82 +26,116 @@ type MetricName int
 
 // List of supported metric names.
 const (
+	// DataNode metrics
 	AllocatedDeviceMemory MetricName = iota
+	AppendedRecords
+	ArchivingCount
+	ArchivingHighWatermark
 	ArchivingIgnoredRecords
+	ArchivingLowWatermark
 	ArchivingRecords
 	ArchivingTimingTotal
-	ArchivingHighWatermark
-	ArchivingLowWatermark
-	BackfillTimingTotal
+	BackfillAffectedDays
+	BackfillBufferFillRatio
+	BackfillBufferNumRecords
+	BackfillBufferSize
+	BackfillCount
+	BackfillDeleteThenInsertRecords
+	BackfillInplaceUpdateRecords
 	BackfillLockTiming
+	BackfillNewRecords
+	BackfillNoEffectRecords
+	BackfillRecords
+	BackfillRecordsColumnRemoved
+	BackfillRecordsRatio
+	BackfillRecordsTimeDifference
+	BackfillTimingTotal
+	BatchSize
+	BatchSizeReportTime
+	CurrentRedologCreationTime
+	CurrentRedologSize
+	DuplicateRecordRatio
 	EstimatedDeviceMemory
 	HTTPHandlerCall
 	HTTPHandlerLatency
+	IngestSkippedRecords
+	IngestedErrorBatches
 	IngestedRecords
-	AppendedRecords
-	UpdatedRecords
+	IngestedRecoveryBatches
 	IngestedUpsertBatches
-	UpsertBatchSize
-	PrimaryKeyMissing
-	TimeColumnMissing
-	BackfillRecords
-	BackfillAffectedDays
-	BackfillNewRecords
-	BackfillNoEffectRecords
-	BackfillInplaceUpdateRecords
-	BackfillDeleteThenInsertRecords
-	BackfillRecordsTimeDifference
-	BackfillRecordsRatio
-	BackfillRecordsColumnRemoved
-	DuplicateRecordRatio
-	RecoveryIgnoredRecordsTimeDifference
-	RecoveryIgnoredRecords
-	RecoveryLatency
-	TotalMemorySize
-	UnmanagedMemorySize
-	ManagedMemorySize
-	BackfillBufferFillRatio
-	BackfillBufferSize
-	BackfillBufferNumRecords
 	IngestionLagPerColumn
-	NumberOfEnumCasesPerColumn
-	CurrentRedologCreationTime
-	CurrentRedologSize
-	NumberOfRedologs
-	SizeOfRedologs
-	QueryFailed
-	QuerySucceeded
-	QueryLatency
-	QuerySQLParsingLatency
-	QueryWaitForMemoryDuration
-	QueryReceived
-	QueryLiveRecordsProcessed
-	QueryArchiveRecordsProcessed
-	QueryLiveBatchProcessed
-	QueryArchiveBatchProcessed
-	QueryLiveBytesTransferred
-	QueryArchiveBytesTransferred
-	QueryRowsReturned
-	RecordsOutOfRetention
-	SnapshotTimingTotal
-	SnapshotTimingLoad
-	SnapshotTimingBuildIndex
-	TimezoneLookupTableCreationTime
-	RedoLogFileCorrupt
+	IngestionWritelockAquireTime
+	IngestionPrimaryKeyLookupTime
+	JobFailuresCount
+	ManagedMemorySize
 	MemoryOverflow
+	NumberOfEnumCasesPerColumn
+	NumberOfRedologs
 	PreloadingZoneEvicted
+	PrimaryKeyMissing
+	PurgeCount
 	PurgeTimingTotal
 	PurgedBatches
+	QueryArchiveBatchProcessed
+	QueryArchiveBytesTransferred
+	QueryArchiveRecordsProcessed
+	QueryBatchTransferTime
+	QueryDimReadLatency
+	QueryFailed
+	QueryLatency
+	QueryLiveBatchProcessed
+	QueryLiveBytesTransferred
+	QueryLiveRecordsProcessed
+	QueryReadLockAcquireTime
+	QueryReceived
+	QueryRowsReturned
+	QuerySQLParsingLatency
+	QuerySucceeded
+	QueryWaitForMemoryDuration
+	RawVPBytesFetched
+	RawVPFetchBytesPerSec
+	RawVPFetchFailure
+	RawVPFetchSuccess
+	RawVPFetchTime
 	RecordsFromFuture
-	BatchSize
-	BatchSizeReportTime
-	SchemaFetchSuccess
-	SchemaFetchFailure
-	SchemaUpdateCount
-	SchemaDeletionCount
+	RecordsOutOfRetention
+	RecoveryIgnoredRecords
+	RecoveryIgnoredRecordsTimeDifference
+	RecoveryLatency
+	RecoveryUpsertBatchSize
+	RedoLogFileCorrupt
 	SchemaCreationCount
-	// Enum sentinel.
-	NumMetricNames
+	SchemaDeletionCount
+	SchemaFetchFailure
+	SchemaFetchFailureEnum
+	SchemaFetchSuccess
+	SchemaUpdateCount
+	SizeOfRedologs
+	SnapshotCount
+	SnapshotTimingBuildIndex
+	SnapshotTimingLoad
+	SnapshotTimingTotal
+	TimeColumnMissing
+	TimezoneLookupTableCreationTime
+	TotalMemorySize
+	TotalRawVPFetchTime
+	UnmanagedMemorySize
+	UpdatedRecords
+	UpsertBatchSize
+
+	// Broker metrics
+	AQLQueryReceivedBroker
+	SQLQueryReceivedBroker
+	QueryFailedBroker
+	QuerySucceededBroker
+	QueryLatencyBroker
+	SQLParsingLatencyBroker
+	QueryPlanExecuteFailures
+	DataNodeQueryFailures
+	TimeWaitedForDataNode
+	TimeSerDeDataNodeResponse
+
+	MetricNamesSentinel
 )
 
 // MetricType is the supported metric type.
@@ -135,6 +169,7 @@ type metricDefinition struct {
 
 // Scope names .
 const (
+	// datanode metrics
 	scopeNameRecoveryLatency                 = "recovery_latency"
 	scopeNameAllocatedDeviceMemory           = "allocated_device_memory"
 	scopeNameArchivingRecords                = "archiving_records"
@@ -159,10 +194,15 @@ const (
 	scopeNameIngestedRecords                 = "ingested_records"
 	scopeNameAppendedRecords                 = "appended_records"
 	scopeNameUpdatedRecords                  = "updated_records"
+	scopeNameIngestSkippedRecords            = "skipped_records"
 	scopeNameIngestedUpsertBatches           = "ingested_upsert_batches"
+	scopeNameIngestedRecoveryBatches         = "ingested_recovery_batches"
+	scopeNameIngestedErrorBatches            = "ingested_error_batches"
 	scopeNameUpsertBatchSize                 = "upsert_batch_size"
+	scopeNameRecoveryUpsertBatchSize         = "recovery_upsert_batch_size"
 	scopeNameLoad                            = "load"
 	scopeNameTotal                           = "total"
+	scopeNameCount                           = "count"
 	scopeNameBuildIndex                      = "build_index"
 	scopeNameTotalMemorySize                 = "total_memory_size"
 	scopeNameUnmanagedMemorySize             = "unmanaged_memory_size"
@@ -179,10 +219,12 @@ const (
 	scopeNameQueryFailed                     = "query_failed"
 	scopeNameQuerySucceeded                  = "query_succeeded"
 	scopeNameQueryLatency                    = "query_latency"
-	scopeNameQuerySQLParsingLatency			 = "sql_parsing_latency"
+	scopeNameQueryDimReadLatency             = "query_dim_read_latency"
+	scopeNameQuerySQLParsingLatency          = "sql_parsing_latency"
 	scopeNameQueryWaitForMemoryDuration      = "query_wait_for_memory_duration"
 	scopeNameQueryReceived                   = "query_received"
 	scopeNameQueryRecordsProcessed           = "records_processed"
+	scopeNameBatchTransferTime				 = "batch_transfer_time"
 	scopeNameQueryBatchProcessed             = "batch_processed"
 	scopeNameQueryBytesTransferred           = "bytes_transferred"
 	scopeNameQueryRowsReturned               = "rows_returned"
@@ -190,6 +232,12 @@ const (
 	scopeNameTimezoneLookupTableCreationTime = "timezone_lookup_table_creation_time"
 	scopeNameRedoLogFileCorrupt              = "redo_log_file_corrupt"
 	scopeNameMemoryOverflow                  = "memory_overflow"
+	scopeNameRawVPBytesFetched               = "raw_vp_bytes_fetched"
+	scopeNameRawVPFetchBytesPerSec           = "raw_vp_fetch_bytes_per_sec"
+	scopeNameRawVPFetchFailure               = "raw_vp_fetch_failure"
+	scopeNameRawVPFetchSuccess               = "raw_vp_fetch_success"
+	scopeNameRawVPFetchTime                  = "raw_vp_fetch_time"
+	scopeNameTotalRawVPFetchTime             = "total_raw_vp_fetch_time"
 	scopeNamePreloadingZoneEvicted           = "preloading_zone_evicted"
 	scopeNameBatchesPurged                   = "purged_batches"
 	scopeNameFutureRecords                   = "records_from_future"
@@ -197,9 +245,26 @@ const (
 	scopeNameBatchSizeReportTime             = "batch_size_report_time"
 	scopeNameSchemaFetchSuccess              = "schema_fetch_success"
 	scopeNameSchemaFetchFailure              = "schema_fetch_failure"
+	scopeNameSchemaFetchFailureEnum          = "schema_fetch_failure_enum"
 	scopeNameSchemaUpdateCount               = "schema_updates"
 	scopeNameSchemaDeletionCount             = "schema_deletions"
 	scopeNameSchemaCreationCount             = "schema_creations"
+	scopeNameJobFailuresCount                = "job_failures_count"
+	scopeNameWriteLockAcquireTime   		 = "writelock_acquire_time"
+	scopeNameReadLockAcquireTime   		 	 = "readlock_acquire_time"
+	scopeNamePrimaryKeyLookupTime			 = "pk_lookup_time"
+
+	// broker metrics
+	scopeNameAQLQueryReceivedBroker    = "aql_query_received_broker"
+	scopeNameSQLQueryReceivedBroker    = "sql_query_received_broker"
+	scopeNameQueryFailedBroker         = "query_failed_broker"
+	scopeNameQuerySucceededBroker      = "query_succeeded_broker"
+	scopeNameQueryLatencyBroker        = "query_latency_broker"
+	scopeNameSQLParsingLatencyBroker   = "sql_parsing_latency_broker"
+	scopeNameQueryPlanExecuteFailures  = "query_plan_execute_failures"
+	scopeNameDataNodeQueryFailures     = "datanode_query_failures"
+	scopeNameTimeWaitedForDataNode     = "time_waited_for_datanodes"
+	scopeNameTimeSerDeDataNodeResponse = "time_serde_response"
 )
 
 // Metric tag names
@@ -233,13 +298,14 @@ const (
 const (
 	metricsOperationArchiving = "archiving"
 	metricsOperationBackfill  = "backfill"
+	metricsOperationBootstrap = "bootstrap"
 	metricsOperationIngestion = "ingestion"
+	metricsOperationPurge     = "purge"
 	metricsOperationRecovery  = "recovery"
 	metricsOperationSnapshot  = "snapshot"
-	metricsOperationPurge     = "purge"
 )
 
-var metricsDefs = map[MetricName]metricDefinition{
+var metricDefs = map[MetricName]metricDefinition{
 	AllocatedDeviceMemory: {
 		name:       scopeNameAllocatedDeviceMemory,
 		metricType: Gauge,
@@ -249,6 +315,14 @@ var metricsDefs = map[MetricName]metricDefinition{
 	},
 	ArchivingIgnoredRecords: {
 		name:       scopeNameBackfillRecords,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationArchiving,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
+	ArchivingCount: {
+		name:       scopeNameCount,
 		metricType: Counter,
 		tags: map[string]string{
 			metricsTagOperation: metricsOperationArchiving,
@@ -303,6 +377,14 @@ var metricsDefs = map[MetricName]metricDefinition{
 			metricsTagComponent: metricsComponentMemStore,
 		},
 	},
+	BackfillCount: {
+		name:       scopeNameCount,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationBackfill,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
 	EstimatedDeviceMemory: {
 		name:       scopeNameEstimatedDeviceMemory,
 		metricType: Gauge,
@@ -348,6 +430,14 @@ var metricsDefs = map[MetricName]metricDefinition{
 			metricsTagComponent: metricsComponentMemStore,
 		},
 	},
+	IngestSkippedRecords: {
+		name:       scopeNameIngestSkippedRecords,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationIngestion,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
 	IngestedUpsertBatches: {
 		name:       scopeNameIngestedUpsertBatches,
 		metricType: Counter,
@@ -356,8 +446,32 @@ var metricsDefs = map[MetricName]metricDefinition{
 			metricsTagComponent: metricsComponentMemStore,
 		},
 	},
+	IngestedRecoveryBatches: {
+		name:       scopeNameIngestedRecoveryBatches,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationIngestion,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
+	IngestedErrorBatches: {
+		name:       scopeNameIngestedErrorBatches,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationIngestion,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
 	UpsertBatchSize: {
 		name:       scopeNameUpsertBatchSize,
+		metricType: Gauge,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationIngestion,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
+	RecoveryUpsertBatchSize: {
+		name:       scopeNameRecoveryUpsertBatchSize,
 		metricType: Gauge,
 		tags: map[string]string{
 			metricsTagOperation: metricsOperationIngestion,
@@ -532,6 +646,22 @@ var metricsDefs = map[MetricName]metricDefinition{
 			metricsTagComponent: metricsComponentMemStore,
 		},
 	},
+	IngestionWritelockAquireTime: {
+		name: scopeNameWriteLockAcquireTime,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationIngestion,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
+	IngestionPrimaryKeyLookupTime: {
+		name: scopeNamePrimaryKeyLookupTime,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationIngestion,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
 	CurrentRedologCreationTime: {
 		name:       scopeNameCurrentRedologCreationTime,
 		metricType: Gauge,
@@ -595,8 +725,22 @@ var metricsDefs = map[MetricName]metricDefinition{
 			metricsTagComponent: metricsComponentQuery,
 		},
 	},
+	QueryDimReadLatency: {
+		name:       scopeNameQueryDimReadLatency,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
 	QueryWaitForMemoryDuration: {
 		name:       scopeNameQueryWaitForMemoryDuration,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	QueryReadLockAcquireTime: {
+		name: scopeNameReadLockAcquireTime,
 		metricType: Timer,
 		tags: map[string]string{
 			metricsTagComponent: metricsComponentQuery,
@@ -623,6 +767,13 @@ var metricsDefs = map[MetricName]metricDefinition{
 		tags: map[string]string{
 			metricsTagComponent: metricsComponentQuery,
 			metricsTagStore:     metricsStoreArchive,
+		},
+	},
+	QueryBatchTransferTime: {
+		name:       scopeNameBatchTransferTime,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
 		},
 	},
 	QueryLiveBatchProcessed: {
@@ -696,6 +847,14 @@ var metricsDefs = map[MetricName]metricDefinition{
 			metricsTagComponent: metricsComponentMemStore,
 		},
 	},
+	SnapshotCount: {
+		name:       scopeNameCount,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationSnapshot,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
 	TimezoneLookupTableCreationTime: {
 		name:       scopeNameTimezoneLookupTableCreationTime,
 		metricType: Timer,
@@ -715,6 +874,54 @@ var metricsDefs = map[MetricName]metricDefinition{
 		metricType: Counter,
 		tags: map[string]string{
 			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
+	RawVPFetchTime: {
+		name:       scopeNameRawVPFetchTime,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentMemStore,
+			metricsTagOperation: metricsOperationBootstrap,
+		},
+	},
+	RawVPBytesFetched: {
+		name:       scopeNameRawVPBytesFetched,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentMemStore,
+			metricsTagOperation: metricsOperationBootstrap,
+		},
+	},
+	RawVPFetchSuccess: {
+		name:       scopeNameRawVPFetchSuccess,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentMemStore,
+			metricsTagOperation: metricsOperationBootstrap,
+		},
+	},
+	RawVPFetchFailure: {
+		name:       scopeNameRawVPFetchFailure,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentMemStore,
+			metricsTagOperation: metricsOperationBootstrap,
+		},
+	},
+	TotalRawVPFetchTime: {
+		name:       scopeNameTotalRawVPFetchTime,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentMemStore,
+			metricsTagOperation: metricsOperationBootstrap,
+		},
+	},
+	RawVPFetchBytesPerSec: {
+		name:       scopeNameRawVPFetchBytesPerSec,
+		metricType: Gauge,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentMemStore,
+			metricsTagOperation: metricsOperationBootstrap,
 		},
 	},
 	PreloadingZoneEvicted: {
@@ -776,6 +983,13 @@ var metricsDefs = map[MetricName]metricDefinition{
 			metricsTagComponent: metricsComponentMetaStore,
 		},
 	},
+	SchemaFetchFailureEnum: {
+		name:       scopeNameSchemaFetchFailureEnum,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentMetaStore,
+		},
+	},
 	SchemaUpdateCount: {
 		name:       scopeNameSchemaUpdateCount,
 		metricType: Counter,
@@ -795,6 +1009,89 @@ var metricsDefs = map[MetricName]metricDefinition{
 		metricType: Counter,
 		tags: map[string]string{
 			metricsTagComponent: metricsComponentMetaStore,
+		},
+	},
+	PurgeCount: {
+		name:       scopeNameCount,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagOperation: metricsOperationPurge,
+			metricsTagComponent: metricsComponentMemStore,
+		},
+	},
+	JobFailuresCount: {
+		name:       scopeNameJobFailuresCount,
+		metricType: Counter,
+		tags:       map[string]string{},
+	},
+	AQLQueryReceivedBroker: {
+		name:       scopeNameAQLQueryReceivedBroker,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	SQLQueryReceivedBroker: {
+		name:       scopeNameSQLQueryReceivedBroker,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	QueryFailedBroker: {
+		name:       scopeNameQueryFailedBroker,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	QuerySucceededBroker: {
+		name:       scopeNameQuerySucceededBroker,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	QueryLatencyBroker: {
+		name:       scopeNameQueryLatencyBroker,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	SQLParsingLatencyBroker: {
+		name:       scopeNameSQLParsingLatencyBroker,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	QueryPlanExecuteFailures: {
+		name:       scopeNameQueryPlanExecuteFailures,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	DataNodeQueryFailures: {
+		name:       scopeNameDataNodeQueryFailures,
+		metricType: Counter,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	TimeWaitedForDataNode: {
+		name:       scopeNameTimeWaitedForDataNode,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
+		},
+	},
+	TimeSerDeDataNodeResponse: {
+		name:       scopeNameTimeSerDeDataNodeResponse,
+		metricType: Timer,
+		tags: map[string]string{
+			metricsTagComponent: metricsComponentQuery,
 		},
 	},
 }
@@ -877,8 +1174,8 @@ type Reporter struct {
 
 // NewReporter returns a new reporter with supplied root scope.
 func NewReporter(rootScope tally.Scope) *Reporter {
-	defs := make([]metricDefinition, NumMetricNames)
-	for key, metricDefinition := range metricsDefs {
+	defs := make([]metricDefinition, int(MetricNamesSentinel))
+	for key, metricDefinition := range metricDefs {
 		metricDefinition.init(rootScope)
 		defs[key] = metricDefinition
 	}

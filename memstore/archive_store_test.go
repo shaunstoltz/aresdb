@@ -15,12 +15,8 @@
 package memstore
 
 import (
-	"errors"
-
 	"encoding/hex"
-
-	"unsafe"
-
+	"errors"
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
@@ -36,7 +32,7 @@ var _ = ginkgo.Describe("archive store", func() {
 	var shardID, batchID int
 	var cutoff uint32 = 100
 
-	m := getFactory().NewMockMemStore()
+	m := GetFactory().NewMockMemStore()
 	hostMemoryManager := NewHostMemoryManager(m, 1<<32)
 
 	ginkgo.It("newArchiveStoreVersion should work", func() {
@@ -48,7 +44,7 @@ var _ = ginkgo.Describe("archive store", func() {
 	ginkgo.It("WriteToDisk should work", func() {
 		ds := new(diskStoreMocks.DiskStore)
 		archiveBatch := &ArchiveBatch{
-			Batch: Batch{
+			Batch: memCom.Batch{
 				RWMutex: &sync.RWMutex{},
 				Columns: []memCom.VectorParty{
 					&archiveVectorParty{
@@ -66,7 +62,7 @@ var _ = ginkgo.Describe("archive store", func() {
 			Shard: &TableShard{
 				diskStore: ds,
 				ShardID:   shardID,
-				Schema: &TableSchema{
+				Schema: &memCom.TableSchema{
 					Schema: metaCom.Table{
 						Name: table,
 					},
@@ -74,9 +70,10 @@ var _ = ginkgo.Describe("archive store", func() {
 			},
 		}
 
-		writer := new(utilsMocks.WriteCloser)
+		writer := new(utilsMocks.WriteSyncCloser)
 		writer.On("Write", mock.Anything).Return(0, nil)
 		writer.On("Close").Return(nil)
+		writer.On("Sync").Return(nil)
 
 		ds.On("OpenVectorPartyFileForWrite",
 			table, mock.Anything, shardID,
@@ -88,7 +85,7 @@ var _ = ginkgo.Describe("archive store", func() {
 		ds := new(diskStoreMocks.DiskStore)
 
 		archiveBatch := &ArchiveBatch{
-			Batch: Batch{
+			Batch: memCom.Batch{
 				RWMutex: &sync.RWMutex{},
 			},
 			Version: cutoff,
@@ -96,7 +93,7 @@ var _ = ginkgo.Describe("archive store", func() {
 			Shard: &TableShard{
 				diskStore: ds,
 				ShardID:   shardID,
-				Schema: &TableSchema{
+				Schema: &memCom.TableSchema{
 					Schema: metaCom.Table{
 						Name: table,
 					},
@@ -128,7 +125,7 @@ var _ = ginkgo.Describe("archive store", func() {
 			SeqNum:  1,
 			Size:    5,
 			BatchID: 1,
-			Batch: Batch{
+			Batch: memCom.Batch{
 				RWMutex: &sync.RWMutex{},
 				Columns: make([]memCom.VectorParty, 3),
 			},
@@ -146,7 +143,7 @@ var _ = ginkgo.Describe("archive store", func() {
 	})
 
 	ginkgo.It("BuildIndex should work", func() {
-		tableSchema := &TableSchema{
+		tableSchema := &memCom.TableSchema{
 			Schema: metaCom.Table{
 				Name:                 "test",
 				IsFactTable:          true,
@@ -163,7 +160,7 @@ var _ = ginkgo.Describe("archive store", func() {
 			PrimaryKeyColumnTypes: []memCom.DataType{memCom.Uint32, memCom.Uint8, memCom.Uint8, memCom.Uint8},
 		}
 
-		batch, err := getFactory().ReadArchiveBatch("backfill/buildIndex")
+		batch, err := GetFactory().ReadArchiveBatch("backfill/buildIndex")
 		Ω(err).Should(BeNil())
 		archiveBatch := &ArchiveBatch{
 			Size:  3,
@@ -178,22 +175,22 @@ var _ = ginkgo.Describe("archive store", func() {
 		row0, err := hex.DecodeString("0000")
 		recordID, existing := pk.Find(row0)
 		Ω(existing).Should(BeTrue())
-		Ω(recordID).Should(Equal(RecordID{Index: 0}))
+		Ω(recordID).Should(Equal(memCom.RecordID{Index: 0}))
 		row1, _ := hex.DecodeString("0001")
 		recordID, existing = pk.Find(row1)
 		Ω(existing).Should(BeTrue())
-		Ω(recordID).Should(Equal(RecordID{Index: 1}))
+		Ω(recordID).Should(Equal(memCom.RecordID{Index: 1}))
 		row2, _ := hex.DecodeString("0102")
 		recordID, existing = pk.Find(row2)
 		Ω(existing).Should(BeTrue())
-		Ω(recordID).Should(Equal(RecordID{Index: 2}))
+		Ω(recordID).Should(Equal(memCom.RecordID{Index: 2}))
 		notExistingRow, _ := hex.DecodeString("0004")
 		recordID, existing = pk.Find(notExistingRow)
 		Ω(existing).Should(BeFalse())
 	})
 
 	ginkgo.It("CopyOnWrite should work", func() {
-		tableSchema := &TableSchema{
+		tableSchema := &memCom.TableSchema{
 			Schema: metaCom.Table{
 				Name:                 "test",
 				IsFactTable:          true,
@@ -209,7 +206,7 @@ var _ = ginkgo.Describe("archive store", func() {
 			DefaultValues:         []*memCom.DataValue{&memCom.NullDataValue, &memCom.NullDataValue, &memCom.NullDataValue, &memCom.NullDataValue},
 		}
 
-		batch, err := getFactory().ReadArchiveBatch("backfill/cloneVPForWrite")
+		batch, err := GetFactory().ReadArchiveBatch("backfill/cloneVPForWrite")
 		Ω(err).Should(BeNil())
 		archiveBatch := &ArchiveBatch{
 			Size:  3,
@@ -222,8 +219,8 @@ var _ = ginkgo.Describe("archive store", func() {
 		clonedVP := archiveBatch.Columns[0].(memCom.ArchiveVectorParty).CopyOnWrite(archiveBatch.Size)
 		Ω(clonedVP.(*archiveVectorParty).nulls).ShouldNot(BeNil())
 		Ω(clonedVP.(*archiveVectorParty).nonDefaultValueCount).Should(BeEquivalentTo(3))
-		Ω(*(*[3]uint32)(unsafe.Pointer(clonedVP.(*archiveVectorParty).values.buffer))).Should(BeEquivalentTo([3]uint32{0, 1, 2}))
-		Ω(*(*uint8)(unsafe.Pointer(clonedVP.(*archiveVectorParty).nulls.buffer))).Should(BeEquivalentTo(0xFF))
+		Ω(*(*[3]uint32)(clonedVP.(*archiveVectorParty).values.Buffer())).Should(BeEquivalentTo([3]uint32{0, 1, 2}))
+		Ω(*(*uint8)(clonedVP.(*archiveVectorParty).nulls.Buffer())).Should(BeEquivalentTo(0xFF))
 
 		// we cannot clone sorted column.
 		Ω(func() { archiveBatch.Columns[1].(memCom.ArchiveVectorParty).CopyOnWrite(archiveBatch.Size) }).Should(Panic())
@@ -238,13 +235,13 @@ var _ = ginkgo.Describe("archive store", func() {
 		clonedVP = archiveBatch.Columns[3].(memCom.ArchiveVectorParty).CopyOnWrite(archiveBatch.Size)
 		Ω(clonedVP.(*archiveVectorParty).values).ShouldNot(BeNil())
 		Ω(clonedVP.(*archiveVectorParty).nulls).ShouldNot(BeNil())
-		Ω(*(*[3]uint32)(unsafe.Pointer(clonedVP.(*archiveVectorParty).values.buffer))).Should(BeEquivalentTo([3]uint32{0, 0, 2}))
-		Ω(*(*uint8)(unsafe.Pointer(clonedVP.(*archiveVectorParty).nulls.buffer))).Should(BeEquivalentTo(5))
+		Ω(*(*[3]uint32)(clonedVP.(*archiveVectorParty).values.Buffer())).Should(BeEquivalentTo([3]uint32{0, 0, 2}))
+		Ω(*(*uint8)(clonedVP.(*archiveVectorParty).nulls.Buffer())).Should(BeEquivalentTo(5))
 		Ω(clonedVP.(*archiveVectorParty).nonDefaultValueCount).Should(BeEquivalentTo(2))
 	})
 
 	ginkgo.It("UnpinVectorParties should work", func() {
-		tableSchema := &TableSchema{
+		tableSchema := &memCom.TableSchema{
 			Schema: metaCom.Table{
 				Name:                 "test",
 				IsFactTable:          true,
@@ -259,7 +256,7 @@ var _ = ginkgo.Describe("archive store", func() {
 			PrimaryKeyColumnTypes: []memCom.DataType{memCom.Uint32, memCom.Uint32, memCom.Uint32, memCom.Uint32},
 		}
 
-		batch, err := getFactory().ReadArchiveBatch("backfill/cloneVPForWrite")
+		batch, err := GetFactory().ReadArchiveBatch("backfill/cloneVPForWrite")
 		Ω(err).Should(BeNil())
 		archiveBatch := &ArchiveBatch{
 			Size:  3,
@@ -277,13 +274,13 @@ var _ = ginkgo.Describe("archive store", func() {
 		}
 
 		for columnID := 0; columnID < 4; columnID++ {
-			Ω(requestedVPs[columnID].(*archiveVectorParty).pins).Should(Equal(1))
+			Ω(requestedVPs[columnID].(*archiveVectorParty).Pins).Should(Equal(1))
 		}
 
 		UnpinVectorParties(requestedVPs)
 
 		for columnID := 0; columnID < 4; columnID++ {
-			Ω(requestedVPs[columnID].(*archiveVectorParty).pins).Should(Equal(0))
+			Ω(requestedVPs[columnID].(*archiveVectorParty).Pins).Should(Equal(0))
 		}
 	})
 })

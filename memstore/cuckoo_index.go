@@ -15,23 +15,18 @@
 package memstore
 
 import (
+	"github.com/uber/aresdb/cgoutils"
 	"math"
 	"math/rand"
 	"unsafe"
 
-	"github.com/uber/aresdb/memstore/common"
-	"github.com/uber/aresdb/memutils"
+	memCom "github.com/uber/aresdb/memstore/common"
 	"github.com/uber/aresdb/utils"
 	"sync"
 	"time"
 )
 
 const (
-	bucketSize = 8
-	// log2(numHashes)
-	log2NumHashes = 2
-	// number of hash functions
-	numHashes = 1 << log2NumHashes
 	// size of the stash
 	stashSize = 4
 	// only when load factor is larger than resizeThreshold
@@ -47,17 +42,17 @@ const (
 	// offsets for bucket
 	// the data layout in a bucket is the following manner
 	// RecordID[8]|signature[8]|eventTime[8](optional)|key[8]
-	offsetToSignature           = bucketSize * recordIDBytes
-	offsetToEventTime           = offsetToSignature + bucketSize*1
-	offsetToKeyWithEventTime    = offsetToEventTime + bucketSize*4
+	offsetToSignature           = memCom.BucketSize * memCom.RecordIDBytes
+	offsetToEventTime           = offsetToSignature + memCom.BucketSize*1
+	offsetToKeyWithEventTime    = offsetToEventTime + memCom.BucketSize*4
 	offsetToKeyWithoutEventTime = offsetToEventTime
 )
 
 type stashEntry struct {
 	isValid   bool
 	eventTime uint32
-	key       Key
-	value     RecordID
+	key       memCom.Key
+	value     memCom.RecordID
 }
 
 type hashResult struct {
@@ -100,7 +95,7 @@ type CuckooIndex struct {
 	staging *stagingEntry
 	// seeds holds the hash function seeds
 	// use different seeds to generate different hash values
-	seeds [numHashes]uint32
+	seeds [memCom.NumHashes]uint32
 
 	// eventTimeCutoff record the smallest timestamp that was
 	eventTimeCutoff uint32
@@ -108,7 +103,7 @@ type CuckooIndex struct {
 	rand *rand.Rand
 
 	// report change of unmanaged memory.
-	hostMemoryManager common.HostMemoryManager
+	hostMemoryManager memCom.HostMemoryManager
 
 	// mutex protects internal buffer for GPU transfer
 	transferLock sync.RWMutex
@@ -116,8 +111,8 @@ type CuckooIndex struct {
 
 type stagingEntry struct {
 	eventTime uint32
-	key       Key
-	value     RecordID
+	key       memCom.Key
+	value     memCom.RecordID
 }
 
 func getDefaultInitNumBuckets() int {
@@ -134,17 +129,17 @@ func (c *CuckooIndex) Size() uint {
 }
 
 // Update updates a key with a new recordID. Return whether key exists in the primary key or not.
-func (c *CuckooIndex) Update(key Key, value RecordID) bool {
+func (c *CuckooIndex) Update(key memCom.Key, value memCom.RecordID) bool {
 	c.transferLock.Lock()
 	defer c.transferLock.Unlock()
 	keyPtr := unsafe.Pointer(&key[0])
-	for hashIndex := 0; hashIndex < numHashes; hashIndex++ {
+	for hashIndex := 0; hashIndex < memCom.NumHashes; hashIndex++ {
 		hashResult := c.hash(keyPtr, hashIndex)
-		for i := 0; i < bucketSize; i++ {
+		for i := 0; i < memCom.BucketSize; i++ {
 			existingSignature := *c.getSignature(hashResult.bucket, i)
 			if !c.recordExpired(hashResult.bucket, i) &&
 				existingSignature == hashResult.signature &&
-				memutils.MemEqual(c.getKey(hashResult.bucket, i), keyPtr, c.keyBytes) {
+				utils.MemEqual(c.getKey(hashResult.bucket, i), keyPtr, c.keyBytes) {
 				*c.getRecordID(hashResult.bucket, i) = value
 				return true
 			}
@@ -154,7 +149,7 @@ func (c *CuckooIndex) Update(key Key, value RecordID) bool {
 	for i := 0; i < stashSize; i++ {
 		if !c.isEmpty(c.stash, i) &&
 			!c.recordExpired(c.stash, i) &&
-			memutils.MemEqual(c.getKey(c.stash, i), keyPtr, c.keyBytes) {
+			utils.MemEqual(c.getKey(c.stash, i), keyPtr, c.keyBytes) {
 			*c.getRecordID(c.stash, i) = value
 			return true
 		}
@@ -163,15 +158,15 @@ func (c *CuckooIndex) Update(key Key, value RecordID) bool {
 }
 
 // Find looks up a record given key
-func (c *CuckooIndex) Find(key Key) (RecordID, bool) {
+func (c *CuckooIndex) Find(key memCom.Key) (memCom.RecordID, bool) {
 	keyPtr := unsafe.Pointer(&key[0])
-	for hashIndex := 0; hashIndex < numHashes; hashIndex++ {
+	for hashIndex := 0; hashIndex < memCom.NumHashes; hashIndex++ {
 		hashResult := c.hash(keyPtr, hashIndex)
-		for i := 0; i < bucketSize; i++ {
+		for i := 0; i < memCom.BucketSize; i++ {
 			existingSignature := *c.getSignature(hashResult.bucket, i)
 			if !c.recordExpired(hashResult.bucket, i) &&
 				existingSignature == hashResult.signature &&
-				memutils.MemEqual(c.getKey(hashResult.bucket, i), keyPtr, c.keyBytes) {
+				utils.MemEqual(c.getKey(hashResult.bucket, i), keyPtr, c.keyBytes) {
 				return *c.getRecordID(hashResult.bucket, i), true
 			}
 		}
@@ -180,16 +175,16 @@ func (c *CuckooIndex) Find(key Key) (RecordID, bool) {
 	for i := 0; i < stashSize; i++ {
 		if !c.isEmpty(c.stash, i) &&
 			!c.recordExpired(c.stash, i) &&
-			memutils.MemEqual(c.getKey(c.stash, i), keyPtr, c.keyBytes) {
+			utils.MemEqual(c.getKey(c.stash, i), keyPtr, c.keyBytes) {
 			return *c.getRecordID(c.stash, i), true
 		}
 	}
-	return RecordID{}, false
+	return memCom.RecordID{}, false
 }
 
 // Capacity returns how many items current primary key can hold.
 func (c *CuckooIndex) Capacity() uint {
-	return uint(c.numBuckets * bucketSize)
+	return uint(c.numBuckets * memCom.BucketSize)
 }
 
 // AllocatedBytes returns the allocated size of primary key in bytes.
@@ -198,11 +193,11 @@ func (c *CuckooIndex) AllocatedBytes() uint {
 }
 
 // FindOrInsert find the existing key or insert a new (key, value) pair
-func (c *CuckooIndex) FindOrInsert(key Key, value RecordID, eventTime uint32) (existingFound bool, recordID RecordID, err error) {
+func (c *CuckooIndex) FindOrInsert(key memCom.Key, value memCom.RecordID, eventTime uint32) (existingFound bool, recordID memCom.RecordID, err error) {
 	c.transferLock.Lock()
 	defer c.transferLock.Unlock()
 	if c.eventTimeExpired(eventTime) {
-		return false, RecordID{}, utils.StackError(nil, "Stale Value, eventTimeCutOff: %d, getEventTime Inserted: %d", c.eventTimeCutoff, eventTime)
+		return false, memCom.RecordID{}, utils.StackError(nil, "Stale Value, eventTimeCutOff: %d, getEventTime Inserted: %d", c.eventTimeCutoff, eventTime)
 	}
 
 	existingFound, added, recordID, hashResults := c.findOrAddNew(unsafe.Pointer(&key[0]), value, eventTime)
@@ -222,16 +217,16 @@ func (c *CuckooIndex) FindOrInsert(key Key, value RecordID, eventTime uint32) (e
 }
 
 // Delete will delete a item with given key
-func (c *CuckooIndex) Delete(key Key) {
+func (c *CuckooIndex) Delete(key memCom.Key) {
 	c.transferLock.Lock()
 	defer c.transferLock.Unlock()
-	var hashResults [numHashes]hashResult
-	for hashIndex := 0; hashIndex < numHashes; hashIndex++ {
+	var hashResults [memCom.NumHashes]hashResult
+	for hashIndex := 0; hashIndex < memCom.NumHashes; hashIndex++ {
 		hashResult := c.hash(unsafe.Pointer(&key[0]), hashIndex)
 		hashResults[hashIndex] = hashResult
-		for i := 0; i < bucketSize; i++ {
+		for i := 0; i < memCom.BucketSize; i++ {
 			if *c.getSignature(hashResult.bucket, i) == hashResult.signature &&
-				memutils.MemEqual(c.getKey(hashResult.bucket, i), unsafe.Pointer(&key[0]), c.keyBytes) {
+				utils.MemEqual(c.getKey(hashResult.bucket, i), unsafe.Pointer(&key[0]), c.keyBytes) {
 				c.numBucketEntries--
 				*c.getSignature(hashResult.bucket, i) = emptySignature
 				return
@@ -241,7 +236,7 @@ func (c *CuckooIndex) Delete(key Key) {
 
 	for i := 0; i < stashSize; i++ {
 		if !c.isEmpty(c.stash, i) &&
-			memutils.MemEqual(c.getKey(c.stash, i), unsafe.Pointer(&key[0]), c.keyBytes) {
+			utils.MemEqual(c.getKey(c.stash, i), unsafe.Pointer(&key[0]), c.keyBytes) {
 			*c.getSignature(c.stash, i) = emptySignature
 			c.numStashEntries--
 			return
@@ -260,9 +255,9 @@ func (c *CuckooIndex) GetEventTimeCutoff() uint32 {
 }
 
 // LockForTransfer locks primary key for transfer and returns PrimaryKeyData
-func (c *CuckooIndex) LockForTransfer() PrimaryKeyData {
+func (c *CuckooIndex) LockForTransfer() memCom.PrimaryKeyData {
 	c.transferLock.RLock()
-	return PrimaryKeyData{
+	return memCom.PrimaryKeyData{
 		Data: c.buckets,
 		// numBuckets plus stash bucket
 		NumBytes:   c.bucketBytes * (c.numBuckets + 1),
@@ -282,7 +277,7 @@ func (c *CuckooIndex) hash(key unsafe.Pointer, index int) hashResult {
 	hashValue := utils.Murmur3Sum32(key, c.keyBytes, c.seeds[index])
 
 	bucketIndex := hashValue % uint32(c.numBuckets)
-	bucket := memutils.MemAccess(c.buckets, int(bucketIndex)*c.bucketBytes)
+	bucket := utils.MemAccess(c.buckets, int(bucketIndex)*c.bucketBytes)
 	signature := c.extractSignatureByte(hashValue)
 
 	return hashResult{
@@ -298,7 +293,7 @@ func (c *CuckooIndex) generateRandomSeeds() {
 }
 
 func (c *CuckooIndex) loadFactor() float64 {
-	return float64(c.numBucketEntries+c.numStashEntries) / float64(c.numBuckets*bucketSize)
+	return float64(c.numBucketEntries+c.numStashEntries) / float64(c.numBuckets*memCom.BucketSize)
 }
 
 // extractSignatureByte get the most significant byte from the hash value
@@ -312,23 +307,23 @@ func (c *CuckooIndex) extractSignatureByte(hashValue uint32) uint8 {
 }
 
 func (c *CuckooIndex) getSignature(bucket unsafe.Pointer, index int) *uint8 {
-	return (*uint8)(memutils.MemAccess(bucket, offsetToSignature+index))
+	return (*uint8)(utils.MemAccess(bucket, offsetToSignature+index))
 }
 
-func (c *CuckooIndex) getRecordID(bucket unsafe.Pointer, index int) *RecordID {
-	return (*RecordID)(memutils.MemAccess(bucket, index*recordIDBytes))
+func (c *CuckooIndex) getRecordID(bucket unsafe.Pointer, index int) *memCom.RecordID {
+	return (*memCom.RecordID)(utils.MemAccess(bucket, index*memCom.RecordIDBytes))
 }
 
 // call should be aware there is no eventime present, this method will return incorrect
 func (c *CuckooIndex) getEventTime(bucket unsafe.Pointer, index int) *uint32 {
-	return (*uint32)(memutils.MemAccess(bucket, offsetToEventTime+index*4))
+	return (*uint32)(utils.MemAccess(bucket, offsetToEventTime+index*4))
 }
 
 func (c *CuckooIndex) getKey(bucket unsafe.Pointer, index int) unsafe.Pointer {
 	if !c.hasEventTime {
-		return memutils.MemAccess(bucket, offsetToKeyWithoutEventTime+index*c.keyBytes)
+		return utils.MemAccess(bucket, offsetToKeyWithoutEventTime+index*c.keyBytes)
 	}
-	return memutils.MemAccess(bucket, offsetToKeyWithEventTime+index*c.keyBytes)
+	return utils.MemAccess(bucket, offsetToKeyWithEventTime+index*c.keyBytes)
 }
 
 func (c *CuckooIndex) isEmpty(bucket unsafe.Pointer, index int) bool {
@@ -344,13 +339,13 @@ func (c *CuckooIndex) eventTimeExpired(eventTime uint32) bool {
 }
 
 // randomSwap randomly pick a bucket position and swap with the value
-func (c *CuckooIndex) randomSwap(key unsafe.Pointer, recordID *RecordID, eventTime *uint32, hashResults [numHashes]hashResult) {
-	hashResult := hashResults[c.rand.Intn(numHashes)]
-	slotIndex := c.rand.Intn(bucketSize)
+func (c *CuckooIndex) randomSwap(key unsafe.Pointer, recordID *memCom.RecordID, eventTime *uint32, hashResults [memCom.NumHashes]hashResult) {
+	hashResult := hashResults[c.rand.Intn(memCom.NumHashes)]
+	slotIndex := c.rand.Intn(memCom.BucketSize)
 
 	*c.getRecordID(hashResult.bucket, slotIndex), *recordID = *recordID, *c.getRecordID(hashResult.bucket, slotIndex)
 	*c.getSignature(hashResult.bucket, slotIndex) = hashResult.signature
-	memutils.MemSwap(c.getKey(hashResult.bucket, slotIndex), key, c.keyBytes)
+	utils.MemSwap(c.getKey(hashResult.bucket, slotIndex), key, c.keyBytes)
 
 	if c.hasEventTime {
 		*c.getEventTime(hashResult.bucket, slotIndex), *eventTime = *eventTime, *c.getEventTime(hashResult.bucket, slotIndex)
@@ -360,11 +355,11 @@ func (c *CuckooIndex) randomSwap(key unsafe.Pointer, recordID *RecordID, eventTi
 // addNew only attempts to add new item into buckets, but not stash
 // and assume there is no existing item
 // and will not do the cuckoo process when the process fail
-func (c *CuckooIndex) addNew(key unsafe.Pointer, recordID RecordID, eventTime uint32) (added bool, hashResults [numHashes]hashResult) {
-	for hashIndex := 0; hashIndex < numHashes; hashIndex++ {
+func (c *CuckooIndex) addNew(key unsafe.Pointer, recordID memCom.RecordID, eventTime uint32) (added bool, hashResults [memCom.NumHashes]hashResult) {
+	for hashIndex := 0; hashIndex < memCom.NumHashes; hashIndex++ {
 		hashResult := c.hash(key, hashIndex)
 		hashResults[hashIndex] = hashResult
-		for i := 0; i < bucketSize; i++ {
+		for i := 0; i < memCom.BucketSize; i++ {
 			if c.isEmpty(hashResult.bucket, i) {
 				c.insertBucket(key, recordID, hashResult.signature, eventTime, hashResult.bucket, i)
 				c.numBucketEntries++
@@ -381,7 +376,7 @@ func (c *CuckooIndex) addNew(key unsafe.Pointer, recordID RecordID, eventTime ui
 }
 
 // find existing or add new item to available slot
-func (c *CuckooIndex) findOrAddNew(key unsafe.Pointer, value RecordID, eventTime uint32) (existingFound bool, added bool, recordID RecordID, hashResults [numHashes]hashResult) {
+func (c *CuckooIndex) findOrAddNew(key unsafe.Pointer, value memCom.RecordID, eventTime uint32) (existingFound bool, added bool, recordID memCom.RecordID, hashResults [memCom.NumHashes]hashResult) {
 	indexToInsert := -1
 	isInsert := false
 	var bucketToInsert unsafe.Pointer
@@ -389,10 +384,10 @@ func (c *CuckooIndex) findOrAddNew(key unsafe.Pointer, value RecordID, eventTime
 
 	// look for existing record in buckets with all hash functions
 	// mark potential slot to insert new record
-	for hashIndex := 0; hashIndex < numHashes; hashIndex++ {
+	for hashIndex := 0; hashIndex < memCom.NumHashes; hashIndex++ {
 		hashResult := c.hash(key, hashIndex)
 		hashResults[hashIndex] = hashResult
-		for i := 0; i < bucketSize; i++ {
+		for i := 0; i < memCom.BucketSize; i++ {
 			isEmpty := c.isEmpty(hashResult.bucket, i)
 			if isEmpty || c.recordExpired(hashResult.bucket, i) {
 				if indexToInsert < 0 {
@@ -401,7 +396,7 @@ func (c *CuckooIndex) findOrAddNew(key unsafe.Pointer, value RecordID, eventTime
 					signatureToInsert = hashResult.signature
 					isInsert = isEmpty
 				}
-			} else if *c.getSignature(hashResult.bucket, i) == hashResult.signature && memutils.MemEqual(c.getKey(hashResult.bucket, i), key, c.keyBytes) {
+			} else if *c.getSignature(hashResult.bucket, i) == hashResult.signature && utils.MemEqual(c.getKey(hashResult.bucket, i), key, c.keyBytes) {
 				existingFound = true
 				recordID = *c.getRecordID(hashResult.bucket, i)
 				return
@@ -412,7 +407,7 @@ func (c *CuckooIndex) findOrAddNew(key unsafe.Pointer, value RecordID, eventTime
 	// look for existing record in stash
 	for i := 0; i < stashSize; i++ {
 		if !c.recordExpired(c.stash, i) && !c.isEmpty(c.stash, i) &&
-			memutils.MemEqual(c.getKey(c.stash, i), key, c.keyBytes) {
+			utils.MemEqual(c.getKey(c.stash, i), key, c.keyBytes) {
 			existingFound = true
 			recordID = *c.getRecordID(c.stash, i)
 			return
@@ -432,9 +427,9 @@ func (c *CuckooIndex) findOrAddNew(key unsafe.Pointer, value RecordID, eventTime
 }
 
 // randomly evict existing item with conflict hash and reinsert
-func (c *CuckooIndex) cuckooAdd(key unsafe.Pointer, recordID RecordID, eventTime uint32, hashResults [numHashes]hashResult) bool {
-	insertKey := make(Key, c.keyBytes)
-	memutils.MemCopy(unsafe.Pointer(&insertKey[0]), key, c.keyBytes)
+func (c *CuckooIndex) cuckooAdd(key unsafe.Pointer, recordID memCom.RecordID, eventTime uint32, hashResults [memCom.NumHashes]hashResult) bool {
+	insertKey := make(memCom.Key, c.keyBytes)
+	utils.MemCopy(unsafe.Pointer(&insertKey[0]), key, c.keyBytes)
 
 	for trial := 0; trial < c.maxTrials; trial++ {
 		c.randomSwap(unsafe.Pointer(&insertKey[0]), &recordID, &eventTime, hashResults)
@@ -464,7 +459,7 @@ func (c *CuckooIndex) cuckooAdd(key unsafe.Pointer, recordID RecordID, eventTime
 			staging.eventTime = eventTime
 		}
 		staging.value = recordID
-		staging.key = make(Key, c.keyBytes)
+		staging.key = make(memCom.Key, c.keyBytes)
 		copy(staging.key, insertKey)
 		c.staging = &staging
 	}
@@ -473,7 +468,7 @@ func (c *CuckooIndex) cuckooAdd(key unsafe.Pointer, recordID RecordID, eventTime
 }
 
 // insert will insert without find existing item
-func (c *CuckooIndex) insert(key unsafe.Pointer, v RecordID, eventTime uint32) bool {
+func (c *CuckooIndex) insert(key unsafe.Pointer, v memCom.RecordID, eventTime uint32) bool {
 	added, hashResults := c.addNew(key, v, eventTime)
 	if !added {
 		return c.cuckooAdd(key, v, eventTime, hashResults)
@@ -481,8 +476,8 @@ func (c *CuckooIndex) insert(key unsafe.Pointer, v RecordID, eventTime uint32) b
 	return true
 }
 
-func (c *CuckooIndex) insertBucket(key unsafe.Pointer, recordID RecordID, signature uint8, eventTime uint32, bucket unsafe.Pointer, index int) {
-	memutils.MemCopy(c.getKey(bucket, index), key, c.keyBytes)
+func (c *CuckooIndex) insertBucket(key unsafe.Pointer, recordID memCom.RecordID, signature uint8, eventTime uint32, bucket unsafe.Pointer, index int) {
+	utils.MemCopy(c.getKey(bucket, index), key, c.keyBytes)
 	*c.getSignature(bucket, index) = signature
 	*c.getRecordID(bucket, index) = recordID
 	if c.hasEventTime {
@@ -506,12 +501,12 @@ func (c *CuckooIndex) resize(resizeFactor float32) (ok bool) {
 	// insert existing keys to new index
 	for i := 0; i < c.numBuckets+1; i++ {
 		var bucket unsafe.Pointer
-		numElements := bucketSize
+		numElements := memCom.BucketSize
 		if i == c.numBuckets {
 			bucket = c.stash
 			numElements = stashSize
 		} else {
-			bucket = memutils.MemAccess(c.buckets, i*c.bucketBytes)
+			bucket = utils.MemAccess(c.buckets, i*c.bucketBytes)
 		}
 
 		for j := 0; j < numElements; j++ {
@@ -541,7 +536,7 @@ func (c *CuckooIndex) resize(resizeFactor float32) (ok bool) {
 	}
 
 	// copy to current index. note transferLock is reused.
-	memutils.HostFree(c.buckets)
+	cgoutils.HostFree(c.buckets)
 	newIndex.hostMemoryManager.ReportUnmanagedSpaceUsageChange(int64(-c.allocatedBytes()))
 
 	c.numBuckets = newIndex.numBuckets
@@ -566,13 +561,13 @@ func (c *CuckooIndex) allocatedBytes() uint {
 func (c *CuckooIndex) allocate() {
 	totalBucketBytes := int(c.allocatedBytes())
 	// allocate buckets plus stash
-	c.buckets = memutils.HostAlloc(totalBucketBytes + c.bucketBytes)
-	c.stash = memutils.MemAccess(c.buckets, totalBucketBytes)
+	c.buckets = cgoutils.HostAlloc(totalBucketBytes + c.bucketBytes)
+	c.stash = utils.MemAccess(c.buckets, totalBucketBytes)
 }
 
 // newCuckooIndex create a cuckoo hashing index
 func newCuckooIndex(keyBytes int, hasEventTime bool, initNumBuckets int,
-	hostMemoryManager common.HostMemoryManager) *CuckooIndex {
+	hostMemoryManager memCom.HostMemoryManager) *CuckooIndex {
 	if initNumBuckets <= 0 {
 		initNumBuckets = getDefaultInitNumBuckets()
 	}
@@ -587,12 +582,12 @@ func newCuckooIndex(keyBytes int, hasEventTime bool, initNumBuckets int,
 	}
 
 	// recordIDBytes + keyBytes + signature (1 byte)
-	var cellBytes = recordIDBytes + cuckooIndex.keyBytes + 1
+	var cellBytes = memCom.RecordIDBytes + cuckooIndex.keyBytes + 1
 	// plus eventTime (4 bytes)
 	if cuckooIndex.hasEventTime {
 		cellBytes += 4
 	}
-	cuckooIndex.bucketBytes = bucketSize * cellBytes
+	cuckooIndex.bucketBytes = memCom.BucketSize * cellBytes
 
 	hostMemoryManager.ReportUnmanagedSpaceUsageChange(int64(cuckooIndex.allocatedBytes()))
 	cuckooIndex.allocate()
@@ -607,7 +602,17 @@ func (c *CuckooIndex) Destruct() {
 	c.transferLock.Lock()
 	defer c.transferLock.Unlock()
 	bytes := c.allocatedBytes()
-	memutils.HostFree(c.buckets)
+	cgoutils.HostFree(c.buckets)
 	c.buckets = nil
 	c.hostMemoryManager.ReportUnmanagedSpaceUsageChange(-int64(bytes))
+}
+
+// NewPrimaryKey create a primary key data structure
+// params:
+//   1. keyBytes, number of bytes of key
+//   2. hasEventTime determine whether primary key should record event time for expiration
+//   3. initNumBuckets determines the starting number of buckets, setting to 0 to use default
+func NewPrimaryKey(keyBytes int, hasEventTime bool, initNumBuckets int,
+	hostMemoryManager memCom.HostMemoryManager) memCom.PrimaryKey {
+	return newCuckooIndex(keyBytes, hasEventTime, initNumBuckets, hostMemoryManager)
 }
